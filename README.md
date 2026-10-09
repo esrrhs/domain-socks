@@ -1,6 +1,10 @@
 # domain-socks
 
+[![Test](https://github.com/esrrhs/domain-socks/actions/workflows/test.yml/badge.svg)](https://github.com/esrrhs/domain-socks/actions/workflows/test.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/esrrhs/domain-socks)](https://goreportcard.com/report/github.com/esrrhs/domain-socks)
+
 A lightweight Fake-IP transparent proxy client designed for OpenWrt and Linux routers. It intercepts DNS queries, assigns RFC 2544 Fake-IPs (`198.18.0.0/15`), intercepts redirected TCP traffic, and forwards it to an upstream SOCKS5 proxy using domain-based requests (`ATYP=0x03`).
+
 
 ## Features
 

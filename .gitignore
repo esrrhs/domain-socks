@@ -1,0 +1,11 @@
+# Binaries
+domain-socks
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

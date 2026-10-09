@@ -88,7 +88,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 	}
 
 	// 针对网络连通性探测 (Captive portal probe) 快速响应 204
-	if dstPort == 80 && captiveProbe(prefix) {
+	if dstPort == 80 && captiveProbe(prefix, domain) {
 		_, _ = c.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
@@ -159,7 +159,33 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 	wg.Wait()
 }
 
-func captiveProbe(prefix []byte) bool {
+func isCaptiveHost(host string) bool {
+	h := strings.ToLower(strings.Trim(host, "."))
+	if h == "" {
+		return false
+	}
+	probes := []string{
+		"connectivitycheck.gstatic.com",
+		"connectivitycheck.android.com",
+		"clients3.google.com",
+		"play.googleapis.com",
+		"connect.rom.miui.com",
+		"wifi.vivo.com.cn",
+		"captive.apple.com",
+		"detectportal.firefox.com",
+	}
+	for _, p := range probes {
+		if h == p || strings.HasSuffix(h, "."+p) {
+			return true
+		}
+	}
+	return false
+}
+
+func captiveProbe(prefix []byte, domain string) bool {
+	if isCaptiveHost(domain) {
+		return true
+	}
 	line := prefix
 	if i := bytes.Index(prefix, []byte("\r\n")); i >= 0 {
 		line = prefix[:i]
@@ -172,7 +198,13 @@ func captiveProbe(prefix []byte) bool {
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
 	}
-	return path == "/generate_204" || path == "/gen_204"
+	path = strings.ToLower(path)
+	switch path {
+	case "/generate_204", "/gen_204", "/ncsi.txt", "/connecttest.txt",
+		"/hotspot-detect.html", "/canonical.html", "/success.txt", "/check_network_status.txt":
+		return true
+	}
+	return false
 }
 
 func setKeepAlive(c net.Conn) {

@@ -118,24 +118,34 @@ func craftClientHello(host string) []byte {
 }
 
 func TestCaptiveProbe(t *testing.T) {
-	yes := []string{
-		"GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\n\r\n",
-		"GET /gen_204?foo=1 HTTP/1.1\r\nHost: www.google.com\r\n\r\n",
-		"HEAD /generate_204 HTTP/1.0\r\n\r\n",
+	yes := []struct {
+		req    string
+		domain string
+	}{
+		{"GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\n\r\n", "connectivitycheck.gstatic.com"},
+		{"GET /gen_204?foo=1 HTTP/1.1\r\nHost: www.google.com\r\n\r\n", "www.google.com"},
+		{"HEAD /generate_204 HTTP/1.0\r\n\r\n", ""},
+		{"GET /check_network_status.txt HTTP/1.1\r\n\r\n", ""},
+		{"GET /ncsi.txt HTTP/1.1\r\n\r\n", ""},
+		{"GET /anything HTTP/1.1\r\n\r\n", "connect.rom.miui.com"},
+		{"GET /anything HTTP/1.1\r\n\r\n", "connectivitycheck.android.com"},
 	}
-	for _, s := range yes {
-		if !captiveProbe([]byte(s)) {
-			t.Fatalf("want probe: %q", s)
+	for _, tc := range yes {
+		if !captiveProbe([]byte(tc.req), tc.domain) {
+			t.Fatalf("want probe: req=%q domain=%q", tc.req, tc.domain)
 		}
 	}
-	no := []string{
-		"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n",
-		"GET /generate_2040 HTTP/1.1\r\n\r\n",
-		"",
+	no := []struct {
+		req    string
+		domain string
+	}{
+		{"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n", "www.google.com"},
+		{"GET /generate_2040 HTTP/1.1\r\n\r\n", "example.com"},
+		{"", ""},
 	}
-	for _, s := range no {
-		if captiveProbe([]byte(s)) {
-			t.Fatalf("not a probe: %q", s)
+	for _, tc := range no {
+		if captiveProbe([]byte(tc.req), tc.domain) {
+			t.Fatalf("not a probe: req=%q domain=%q", tc.req, tc.domain)
 		}
 	}
 }

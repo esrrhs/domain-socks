@@ -16,6 +16,8 @@ import (
 
 func main() {
 	socks := flag.String("socks", "192.168.1.101:1081", "upstream socks5")
+	socksUser := flag.String("socks-user", "", "upstream socks5 username")
+	socksPass := flag.String("socks-pass", "", "upstream socks5 password")
 	dnsAddr := flag.String("dns", "127.0.0.1:1053", "dns listen address")
 	listen := flag.String("listen", "0.0.0.0:12345", "transparent redirect listen")
 	directDNS := flag.String("direct-dns", "223.5.5.5:53,119.29.29.29:53", "domestic upstream DNS servers (comma-separated)")
@@ -57,11 +59,11 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(c, resolver, *socks)
+		go handleConn(c, resolver, *socks, *socksUser, *socksPass)
 	}
 }
 
-func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string) {
+func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string) {
 	defer c.Close()
 	dstIP, dstPort, err := originalDst(c)
 	if err != nil {
@@ -114,7 +116,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string) {
 			targetDesc = dstIP.String()
 		}
 		how = "socks"
-		up, err = socksConnect(proxy, domain, dstIP, dstPort)
+		up, err = socksConnect(proxy, domain, dstIP, dstPort, socksUser, socksPass)
 		if err != nil {
 			log.Printf("socks fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
 			return

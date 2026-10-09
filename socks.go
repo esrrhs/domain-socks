@@ -13,15 +13,15 @@ import (
 // manual test succeeded.
 var handshakeSlots = make(chan struct{}, 12)
 
-func socksConnect(proxy string, host string, ip net.IP, port int) (net.Conn, error) {
+func socksConnect(proxy string, host string, ip net.IP, port int, user string, pass string) (net.Conn, error) {
 	handshakeSlots <- struct{}{}
 	defer func() { <-handshakeSlots }()
-	conn, err := socksConnectOnce(proxy, host, ip, port)
+	conn, err := socksConnectOnce(proxy, host, ip, port, user, pass)
 	if err == nil || !isTimeout(err) {
 		return conn, err
 	}
 	time.Sleep(300 * time.Millisecond)
-	return socksConnectOnce(proxy, host, ip, port)
+	return socksConnectOnce(proxy, host, ip, port, user, pass)
 }
 
 func isTimeout(err error) bool {
@@ -32,25 +32,65 @@ func isTimeout(err error) bool {
 	return ok && ne.Timeout()
 }
 
-func socksConnectOnce(proxy string, host string, ip net.IP, port int) (net.Conn, error) {
+func socksConnectOnce(proxy string, host string, ip net.IP, port int, user string, pass string) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", proxy, 8*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
-	if _, err = conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		conn.Close()
-		return nil, err
+
+	// 协商认证方式
+	if user != "" || pass != "" {
+		// 支持免密(0x00)与用户名/密码认证(0x02)
+		if _, err = conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	} else {
+		if _, err = conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
+
 	greet := make([]byte, 2)
 	if _, err = io.ReadFull(conn, greet); err != nil {
 		conn.Close()
 		return nil, err
 	}
-	if greet[0] != 0x05 || greet[1] != 0x00 {
+	if greet[0] != 0x05 {
 		conn.Close()
-		return nil, fmt.Errorf("socks auth %v", greet)
+		return nil, fmt.Errorf("socks version %d", greet[0])
 	}
+
+	if greet[1] == 0x02 { // 需要用户名/密码认证 (RFC 1929)
+		if len(user) > 255 || len(pass) > 255 {
+			conn.Close()
+			return nil, fmt.Errorf("socks credentials too long")
+		}
+		authReq := make([]byte, 0, 3+len(user)+len(pass))
+		authReq = append(authReq, 0x01, byte(len(user)))
+		authReq = append(authReq, user...)
+		authReq = append(authReq, byte(len(pass)))
+		authReq = append(authReq, pass...)
+		if _, err = conn.Write(authReq); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		authResp := make([]byte, 2)
+		if _, err = io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if authResp[1] != 0x00 {
+			conn.Close()
+			return nil, fmt.Errorf("socks auth failed: %v", authResp)
+		}
+	} else if greet[1] != 0x00 {
+		conn.Close()
+		return nil, fmt.Errorf("socks auth method refused: %v", greet)
+	}
+
 	var req []byte
 	req = append(req, 0x05, 0x01, 0x00)
 	if host != "" {

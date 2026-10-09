@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -137,4 +138,63 @@ func TestCaptiveProbe(t *testing.T) {
 			t.Fatalf("not a probe: %q", s)
 		}
 	}
+}
+
+func TestSocks5AuthServer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	expectedUser := "testuser"
+	expectedPass := "testpass"
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+
+		// Read greeting
+		buf := make([]byte, 256)
+		n, err := c.Read(buf)
+		if err != nil || n < 3 || buf[0] != 0x05 {
+			return
+		}
+		// Expect user/pass method
+		c.Write([]byte{0x05, 0x02})
+
+		// Read auth
+		n, err = c.Read(buf)
+		if err != nil || n < 5 || buf[0] != 0x01 {
+			return
+		}
+		ulen := int(buf[1])
+		u := string(buf[2 : 2+ulen])
+		plen := int(buf[2+ulen])
+		p := string(buf[3+ulen : 3+ulen+plen])
+
+		if u == expectedUser && p == expectedPass {
+			c.Write([]byte{0x01, 0x00}) // auth success
+		} else {
+			c.Write([]byte{0x01, 0x01}) // auth failure
+			return
+		}
+
+		// Read connect request
+		n, err = c.Read(buf)
+		if err != nil || n < 4 || buf[1] != 0x01 {
+			return
+		}
+		// Reply success: BND.ADDR 0.0.0.0:0
+		c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}()
+
+	conn, err := socksConnect(ln.Addr().String(), "example.com", nil, 80, expectedUser, expectedPass)
+	if err != nil {
+		t.Fatalf("socksConnect with user/pass failed: %v", err)
+	}
+	conn.Close()
 }

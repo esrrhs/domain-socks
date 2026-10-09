@@ -26,6 +26,8 @@ domain-socks -socks <proxy_ip:port> -dns <dns_listen> -listen <redirect_listen>
 ### Options
 
 - `-socks`: Upstream SOCKS5 proxy address (default: `192.168.1.101:1081`)
+- `-socks-user`: Upstream SOCKS5 username (optional, RFC 1929)
+- `-socks-pass`: Upstream SOCKS5 password (optional, RFC 1929)
 - `-dns`: DNS listen address (UDP/TCP, default: `127.0.0.1:1053`)
 - `-listen`: Transparent redirect TCP listen address (default: `0.0.0.0:12345`)
 - `-direct-dns`: Upstream DNS servers for domestic queries (comma-separated, default: `223.5.5.5:53,119.29.29.29:53`)

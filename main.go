@@ -3,81 +3,53 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	ghdns "github.com/esrrhs/gohome/dns"
 )
-
-type fakeMap struct {
-	mu    sync.Mutex
-	next  uint32
-	toIP  map[string][4]byte
-	toDom map[[4]byte]string
-}
-
-func newFakeMap() *fakeMap {
-	return &fakeMap{
-		next:  ip4tou32(net.IPv4(198, 18, 0, 1)),
-		toIP:  map[string][4]byte{},
-		toDom: map[[4]byte]string{},
-	}
-}
-
-func ip4tou32(ip net.IP) uint32 {
-	b := ip.To4()
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-func u32toip(v uint32) [4]byte {
-	return [4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
-}
-
-func (m *fakeMap) assign(domain string) [4]byte {
-	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if ip, ok := m.toIP[domain]; ok {
-		return ip
-	}
-	// 198.18.0.0/15 ends at 198.19.255.254
-	if m.next >= ip4tou32(net.IPv4(198, 20, 0, 0)) {
-		m.next = ip4tou32(net.IPv4(198, 18, 0, 1))
-	}
-	ip := u32toip(m.next)
-	m.next++
-	m.toIP[domain] = ip
-	m.toDom[ip] = domain
-	log.Printf("fakeip %s -> %d.%d.%d.%d", domain, ip[0], ip[1], ip[2], ip[3])
-	return ip
-}
-
-func (m *fakeMap) domain(ip net.IP) string {
-	b := ip.To4()
-	if b == nil {
-		return ""
-	}
-	var key [4]byte
-	copy(key[:], b)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.toDom[key]
-}
 
 func main() {
 	socks := flag.String("socks", "192.168.1.101:1081", "upstream socks5")
-	dnsAddr := flag.String("dns", "127.0.0.1:1053", "fake-ip dns listen")
+	dnsAddr := flag.String("dns", "127.0.0.1:1053", "dns listen address")
 	listen := flag.String("listen", "0.0.0.0:12345", "transparent redirect listen")
+	directDNS := flag.String("direct-dns", "223.5.5.5:53,119.29.29.29:53", "domestic upstream DNS servers (comma-separated)")
+	directDomainsFile := flag.String("direct-domains-file", "", "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
 	flag.Parse()
 
-	fm := newFakeMap()
-	go serveDNS(*dnsAddr, fm)
-	log.Printf("domain-socks socks=%s dns=%s listen=%s", *socks, *dnsAddr, *listen)
+	// 1. 初始化 gohome DNS Resolver 配置
+	cfg := ghdns.DefaultConfig()
+	cfg.EnableFakeIP = true // 代理域名返回 Fake-IP；国内直连域名返回真实 IP
+	if *directDNS != "" {
+		cfg.DirectUpstreams = strings.Split(*directDNS, ",")
+	}
+	if *directDomainsFile != "" {
+		cfg.DirectDomainFiles = []string{*directDomainsFile}
+	}
+
+	resolver, err := ghdns.NewResolver(cfg)
+	if err != nil {
+		log.Fatalf("init resolver failed: %v", err)
+	}
+
+	// 2. 启动 DNS 服务端
+	dnsServer := ghdns.NewServer(*dnsAddr, resolver)
+	if err := dnsServer.Start(); err != nil {
+		log.Fatalf("start dns server on %s failed: %v", *dnsAddr, err)
+	}
+	defer dnsServer.Stop()
+
+	log.Printf("domain-socks started: socks=%s dns=%s listen=%s", *socks, *dnsAddr, *listen)
+
+	// 3. 监听透明重定向连接
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("listen tcp %s: %v", *listen, err)
 	}
 	for {
 		c, err := ln.Accept()
@@ -85,50 +57,26 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(c, fm, *socks)
+		go handleConn(c, resolver, *socks)
 	}
 }
 
-func serveDNS(addr string, fm *fakeMap) {
-	pc, err := net.ListenPacket("udp", addr)
-	if err != nil {
-		log.Fatalf("dns: %v", err)
-	}
-	defer pc.Close()
-	buf := make([]byte, 1500)
-	for {
-		n, peer, err := pc.ReadFrom(buf)
-		if err != nil {
-			log.Printf("dns read: %v", err)
-			continue
-		}
-		q := append([]byte(nil), buf[:n]...)
-		name, off, err := decodeName(q, 12)
-		if err != nil || off+2 > len(q) {
-			continue
-		}
-		qtype := uint16(q[off])<<8 | uint16(q[off+1])
-		var ip [4]byte
-		if qtype == 1 && name != "" {
-			ip = fm.assign(name)
-		}
-		resp, _, err := fakeResponse(q, ip, 120)
-		if err != nil {
-			continue
-		}
-		_, _ = pc.WriteTo(resp, peer)
-	}
-}
-
-func handleConn(c net.Conn, fm *fakeMap, proxy string) {
+func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string) {
 	defer c.Close()
 	dstIP, dstPort, err := originalDst(c)
 	if err != nil {
 		log.Printf("original dst: %v", err)
 		return
 	}
-	domain := fm.domain(dstIP)
+
+	isFake := resolver.IsFakeIP(dstIP)
+	var domain string
+	if isFake {
+		domain, _ = resolver.LookupDomainByFakeIP(dstIP)
+	}
+
 	var prefix []byte
+	// 如果无法通过 fake-ip 确定域名，或者目标是 HTTP 80 端口，尝试嗅探应用层报文
 	if domain == "" || dstPort == 80 {
 		var sniffed string
 		prefix, sniffed = peekHost(c)
@@ -136,34 +84,64 @@ func handleConn(c net.Conn, fm *fakeMap, proxy string) {
 			domain = sniffed
 		}
 	}
+
+	// 针对网络连通性探测 (Captive portal probe) 快速响应 204
 	if dstPort == 80 && captiveProbe(prefix) {
 		_, _ = c.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
-	up, err := socksConnect(proxy, domain, dstIP, dstPort)
-	if err != nil {
+
+	// 判断是否走代理分流：
+	// 1. 若目标 IP 是 Fake-IP，或者域名/IP 经 resolver.ShouldProxy 判定需要走代理 -> 走 SOCKS5
+	// 2. 若不是 Fake-IP 且属于直连目标 -> 直接 net.Dial 目标真实地址直连
+	shouldProxy := isFake
+	if !shouldProxy {
 		target := domain
 		if target == "" {
 			target = dstIP.String()
 		}
-		log.Printf("socks fail %s -> %s:%d: %v", c.RemoteAddr(), target, dstPort, err)
-		return
+		sp, _ := resolver.ShouldProxy(target)
+		shouldProxy = sp
+	}
+
+	var up net.Conn
+	var how string
+	var targetDesc string
+
+	if shouldProxy {
+		targetDesc = domain
+		if targetDesc == "" {
+			targetDesc = dstIP.String()
+		}
+		how = "socks"
+		up, err = socksConnect(proxy, domain, dstIP, dstPort)
+		if err != nil {
+			log.Printf("socks fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
+			return
+		}
+	} else {
+		// 直连直达
+		targetDesc = dstIP.String()
+		how = "direct"
+		up, err = net.DialTimeout("tcp", net.JoinHostPort(targetDesc, fmt.Sprintf("%d", dstPort)), 8*time.Second)
+		if err != nil {
+			log.Printf("direct fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
+			return
+		}
 	}
 	defer up.Close()
-	target := domain
-	how := "domain"
-	if target == "" {
-		target = dstIP.String()
-		how = "ip"
-	}
-	log.Printf("socks ok %s %s -> %s:%d", how, c.RemoteAddr(), target, dstPort)
+
+	log.Printf("conn ok [%s] %s -> %s:%d", how, c.RemoteAddr(), targetDesc, dstPort)
+
 	if len(prefix) > 0 {
 		if _, err = up.Write(prefix); err != nil {
 			return
 		}
 	}
+
 	setKeepAlive(c)
 	setKeepAlive(up)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {

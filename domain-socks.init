@@ -2,14 +2,316 @@
 START=95
 USE_PROCD=1
 
+# 可在 /etc/local.d 或本文件头部按现场覆盖
+PROXY_SERVER="${PROXY_SERVER:-192.168.1.101:1081}"
+DNS_PORT="${DNS_PORT:-1053}"
+REDIR_PORT="${REDIR_PORT:-12345}"
+
+# UDP 透明转发（SOCKS5 UDP ASSOCIATE）默认关闭：
+# 置 1 后按下面的 nat 规则把 LAN UDP 流量重定向到 domain-socks，
+# 并在命令行追加 -udplisten。需要内核 nf_conntrack（OpenWrt 防火墙默认带）。
+ENABLE_UDP="${ENABLE_UDP:-0}"
+UDP_PORT="${UDP_PORT:-12346}"
+
+# TPROXY 模式（与上面的 REDIRECT 模式互斥，二选一）：
+# 置 1 后 TCP 走 mangle TPROXY 双栈监听（-tproxy），同时具备 IPv6 截获能力；
+# ENABLE_UDP=1 时 UDP 也走 TPROXY（-udp-tproxy）。
+# 前置条件：kmod-ipt-tproxy（含 xt_TPROXY/xt_socket）、ip-full；
+# IPv6 还需 kmod-ipt-tproxy 的 ip6 支持（nf_tproxy_ipv6）、ip6tables，
+# 以及 kmod-ipt-nat6（v6 DNS 劫持走 ip6tables nat REDIRECT）。
+ENABLE_TPROXY="${ENABLE_TPROXY:-0}"
+TPROXY_MARK="${TPROXY_MARK:-0x3f}"
+TPROXY_TABLE="${TPROXY_TABLE:-100}"
+
+# 保留/内网网段：这些目标不做透明重定向（Fake-IP 198.18.0.0/15 不在其列，必须重定向）
+RESERVED_CIDRS="
+	0.0.0.0/8
+	10.0.0.0/8
+	127.0.0.0/8
+	169.254.0.0/16
+	172.16.0.0/12
+	192.168.0.0/16
+	100.64.0.0/10
+	224.0.0.0/4
+	240.0.0.0/4
+"
+
+NAT_CHAIN="DOMAIN_SOCKS"
+NAT_UDP_CHAIN="DOMAIN_SOCKS_UDP"
+FILT_CHAIN="DOMAIN_SOCKS_R"
+TP_CHAIN="DOMAIN_SOCKS_TP"
+TP6_CHAIN="DOMAIN_SOCKS_TP6"
+DIV_CHAIN="DOMAIN_SOCKS_DIV"
+DIV6_CHAIN="DOMAIN_SOCKS_DIV6"
+FILT6_CHAIN="DOMAIN_SOCKS_R6"
+
+# IPv6 保留网段（本机/链路本地/唯一本地/组播）
+RESERVED6_CIDRS="
+	::1/128
+	fc00::/7
+	fe80::/10
+	ff00::/8
+"
+
 start_service() {
+	local args
+	args="-socks $PROXY_SERVER
+		-dns [::]:$DNS_PORT"
+	if [ "$ENABLE_TPROXY" = "1" ]; then
+		# :port 双栈监听，单条 TCP TPROXY 规则同时覆盖 IPv4/IPv6
+		args="$args -tproxy :$REDIR_PORT"
+		if [ "$ENABLE_UDP" = "1" ]; then
+			args="$args -udp-tproxy :$UDP_PORT"
+		fi
+	else
+		args="$args -listen 0.0.0.0:$REDIR_PORT"
+		if [ "$ENABLE_UDP" = "1" ]; then
+			args="$args -udplisten 0.0.0.0:$UDP_PORT"
+		fi
+	fi
+
 	procd_open_instance
-	procd_set_param command /usr/bin/domain-socks \
-		-socks 192.168.1.101:1081 \
-		-dns 127.0.0.1:1053 \
-		-listen 0.0.0.0:12345
+	# -dns 的 [::]:port 含 glob 字符 '['，关闭文件名展开后再分词传参，
+	# 避免极端情况下被匹配文件替换（rc.common 环境默认 nullglob 关闭）
+	set -f
+	# shellcheck disable=SC2086
+	procd_set_param command /usr/bin/domain-socks $args
+	set +f
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
+
+	start_firewall
+}
+
+stop_service() {
+	stop_firewall
+}
+
+# start_firewall 只劫持 PREROUTING（LAN 设备转发流量），不碰 OUTPUT：
+# domain-socks 自身发起的直连/SOCKS 连接从 OUTPUT 出去，若也重定向会回到
+# 自己形成回环。需要代理路由器本机流量时，请用 -m owner 按专用 uid 排除。
+start_firewall() {
+	# --- 1. DNS 劫持（v4，nat REDIRECT；两种模式共用）---
+	iptables -t nat -C PREROUTING -p udp --dport 53 \
+		-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null || \
+		iptables -t nat -I PREROUTING 1 -p udp --dport 53 \
+			-j REDIRECT --to-ports "$DNS_PORT"
+	iptables -t nat -C PREROUTING -p tcp --dport 53 \
+		-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null || \
+		iptables -t nat -I PREROUTING 1 -p tcp --dport 53 \
+			-j REDIRECT --to-ports "$DNS_PORT"
+
+	# --- 1b. DNS 劫持（v6，nat REDIRECT；两种模式共用）---
+	# 与 v4 同款：LAN 客户端无论将 v6 DNS 发往哪台服务器，都改投本机
+	# 双栈 DNS 监听，Fake-IP/分流闭环不再依赖 RA 宣告的路由器地址。
+	# 需要 ip6tables 与 ip6table_nat（OpenWrt 软件包 kmod-ipt-nat6）；
+	# mangle 链中 53 的 RETURN 保证报文先落到 nat 表而不被 TPROXY 接管。
+	if command -v ip6tables >/dev/null 2>&1; then
+		for dns_proto in udp tcp; do
+			if ! ip6tables -t nat -C PREROUTING -p "$dns_proto" --dport 53 \
+				-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null; then
+				ip6tables -t nat -I PREROUTING 1 -p "$dns_proto" --dport 53 \
+					-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null || \
+					echo "WARNING: ip6tables $dns_proto/53 REDIRECT not installed (install kmod-ipt-nat6 for IPv6 DNS hijack)"
+			fi
+		done
+	fi
+
+	if [ "$ENABLE_TPROXY" = "1" ]; then
+		start_tproxy_firewall
+		return
+	fi
+
+	# --- 2. TCP 透明重定向链 ---
+	iptables -t nat -N "$NAT_CHAIN" 2>/dev/null
+	iptables -t nat -F "$NAT_CHAIN"
+	iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j RETURN
+	for cidr in $RESERVED_CIDRS; do
+		iptables -t nat -A "$NAT_CHAIN" -d "$cidr" -j RETURN
+	done
+	iptables -t nat -A "$NAT_CHAIN" -p tcp \
+		-j REDIRECT --to-ports "$REDIR_PORT"
+	iptables -t nat -C PREROUTING -p tcp -j "$NAT_CHAIN" 2>/dev/null || \
+		iptables -t nat -A PREROUTING -p tcp -j "$NAT_CHAIN"
+
+	# --- 2b. 可选：UDP 透明重定向（SOCKS5 UDP ASSOCIATE）---
+	if [ "$ENABLE_UDP" = "1" ]; then
+		iptables -t nat -N "$NAT_UDP_CHAIN" 2>/dev/null
+		iptables -t nat -F "$NAT_UDP_CHAIN"
+		iptables -t nat -A "$NAT_UDP_CHAIN" -p udp --dport 53 -j RETURN
+		# 443 放行到 FORWARD 链，由下面的 REJECT 规则逼 QUIC 回退 TCP；
+		# 若上游支持 UDP 且希望代理 QUIC，删除这一行即可
+		iptables -t nat -A "$NAT_UDP_CHAIN" -p udp --dport 443 -j RETURN
+		for cidr in $RESERVED_CIDRS; do
+			iptables -t nat -A "$NAT_UDP_CHAIN" -d "$cidr" -j RETURN
+		done
+		iptables -t nat -A "$NAT_UDP_CHAIN" -p udp \
+			-j REDIRECT --to-ports "$UDP_PORT"
+		iptables -t nat -C PREROUTING -p udp -j "$NAT_UDP_CHAIN" 2>/dev/null || \
+			iptables -t nat -A PREROUTING -p udp -j "$NAT_UDP_CHAIN"
+	fi
+
+	# --- 3. 封堵 QUIC (UDP 443)：回 ICMP port unreachable 促使浏览器
+	#       快速回退到 TLS/TCP，否则 HTTP/3 流量不走透明代理 ---
+	iptables -N "$FILT_CHAIN" 2>/dev/null
+	iptables -F "$FILT_CHAIN"
+	iptables -A "$FILT_CHAIN" -p udp --dport 443 \
+		-j REJECT --reject-with icmp-port-unreachable
+	iptables -C FORWARD -j "$FILT_CHAIN" 2>/dev/null || \
+		iptables -I FORWARD 1 -j "$FILT_CHAIN"
+}
+
+# tproxy_policy_route 建立 fwmark -> local 表的策略路由（v4/v6）。
+# TPROXY 打了标记的报文需要被路由到 lo 才能由本地透明 socket 接管。
+tproxy_policy_route() {
+	ip rule list 2>/dev/null | grep -q "from all fwmark 0x${TPROXY_MARK#0x}" || \
+		ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null
+	ip route show table "$TPROXY_TABLE" 2>/dev/null | grep -q 'local 0.0.0.0/0' || \
+		ip route add local 0.0.0.0/0 dev lo table "$TPROXY_TABLE" 2>/dev/null
+	if command -v ip6tables >/dev/null 2>&1; then
+		ip -6 rule list 2>/dev/null | grep -q "from all fwmark 0x${TPROXY_MARK#0x}" || \
+			ip -6 rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null
+		ip -6 route show table "$TPROXY_TABLE" 2>/dev/null | grep -q 'local ::/0' || \
+			ip -6 route add local ::/0 dev lo table "$TPROXY_TABLE" 2>/dev/null
+	fi
+}
+
+# tproxy_family 安装单协议族（v4 或 v6）的 mangle 规则：
+# $1=iptables 路径 $2=DIVERT 链名 $3=TPROXY 链名 $4=保留网段列表
+# $5=TCP on-port $6=UDP on-port $7=是否安装 UDP 规则（1/0）
+tproxy_family() {
+	local ipt="$1" div="$2" chain="$3" cidrs="$4" tcp_port="$5" udp_port="$6" with_udp="$7"
+
+	# DIVERT：已存在本地透明 socket 的流量直接打标记放行（TCP 必须）
+	$ipt -t mangle -N "$div" 2>/dev/null
+	$ipt -t mangle -F "$div"
+	$ipt -A "$div" -t mangle -j MARK --set-mark "$TPROXY_MARK"
+	$ipt -A "$div" -t mangle -j ACCEPT
+	$ipt -t mangle -C PREROUTING -p tcp -m socket -j "$div" 2>/dev/null || \
+		$ipt -t mangle -A PREROUTING -p tcp -m socket -j "$div"
+
+	$ipt -t mangle -N "$chain" 2>/dev/null
+	$ipt -t mangle -F "$chain"
+	# DNS 放行给 nat 表 REDIRECT（v4/v6 均在公共区安装），不被 TPROXY 接管
+	$ipt -t mangle -A "$chain" -p tcp --dport 53 -j RETURN
+	$ipt -t mangle -A "$chain" -p udp --dport 53 -j RETURN
+	if [ "$with_udp" = "1" ]; then
+		# 443 放行：由 FORWARD 的 REJECT 逼 QUIC 回退 TCP
+		$ipt -t mangle -A "$chain" -p udp --dport 443 -j RETURN
+	fi
+	for cidr in $cidrs; do
+		$ipt -t mangle -A "$chain" -d "$cidr" -j RETURN
+	done
+	$ipt -t mangle -A "$chain" -p tcp \
+		-j TPROXY --on-port "$tcp_port" --tproxy-mark "$TPROXY_MARK"
+	if [ "$with_udp" = "1" ]; then
+		$ipt -t mangle -A "$chain" -p udp \
+			-j TPROXY --on-port "$udp_port" --tproxy-mark "$TPROXY_MARK"
+	fi
+
+	$ipt -t mangle -C PREROUTING -p tcp -j "$chain" 2>/dev/null || \
+		$ipt -t mangle -A PREROUTING -p tcp -j "$chain"
+	if [ "$with_udp" = "1" ]; then
+		$ipt -t mangle -C PREROUTING -p udp -j "$chain" 2>/dev/null || \
+			$ipt -t mangle -A PREROUTING -p udp -j "$chain"
+	fi
+}
+
+start_tproxy_firewall() {
+	tproxy_policy_route
+
+	local with_udp=0
+	[ "$ENABLE_UDP" = "1" ] && with_udp=1
+
+	# 同一对 DIVERT/TP 链内同时安装 TCP 与 UDP 规则；
+	# 无 UDP 时 --on-port 仍传 TCP 端口，UDP 规则跳过
+	tproxy_family iptables "$DIV_CHAIN" "$TP_CHAIN" "$RESERVED_CIDRS" \
+		"$REDIR_PORT" "$UDP_PORT" "$with_udp"
+	if command -v ip6tables >/dev/null 2>&1; then
+		tproxy_family ip6tables "$DIV6_CHAIN" "$TP6_CHAIN" "$RESERVED6_CIDRS" \
+			"$REDIR_PORT" "$UDP_PORT" "$with_udp"
+	fi
+
+	# 封堵 QUIC (UDP 443)
+	iptables -N "$FILT_CHAIN" 2>/dev/null
+	iptables -F "$FILT_CHAIN"
+	iptables -A "$FILT_CHAIN" -p udp --dport 443 \
+		-j REJECT --reject-with icmp-port-unreachable
+	iptables -C FORWARD -j "$FILT_CHAIN" 2>/dev/null || \
+		iptables -I FORWARD 1 -j "$FILT_CHAIN"
+	if command -v ip6tables >/dev/null 2>&1; then
+		ip6tables -N "$FILT6_CHAIN" 2>/dev/null
+		ip6tables -F "$FILT6_CHAIN"
+		ip6tables -A "$FILT6_CHAIN" -p udp --dport 443 \
+			-j REJECT --reject-with icmp6-port-unreachable
+		ip6tables -C FORWARD -j "$FILT6_CHAIN" 2>/dev/null || \
+			ip6tables -I FORWARD 1 -j "$FILT6_CHAIN"
+	fi
+}
+
+stop_firewall() {
+	if [ "$ENABLE_TPROXY" = "1" ]; then
+		stop_tproxy_firewall
+	fi
+
+	# 删除跳转引用（幂等）
+	while iptables -t nat -D PREROUTING -p tcp -j "$NAT_CHAIN" 2>/dev/null; do :; done
+	while iptables -t nat -D PREROUTING -p udp -j "$NAT_UDP_CHAIN" 2>/dev/null; do :; done
+	iptables -t nat -D PREROUTING -p udp --dport 53 \
+		-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
+	iptables -t nat -D PREROUTING -p tcp --dport 53 \
+		-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
+	if command -v ip6tables >/dev/null 2>&1; then
+		ip6tables -t nat -D PREROUTING -p udp --dport 53 \
+			-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
+		ip6tables -t nat -D PREROUTING -p tcp --dport 53 \
+			-j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
+	fi
+	while iptables -D FORWARD -j "$FILT_CHAIN" 2>/dev/null; do :; done
+
+	# 清空并删除自建链
+	iptables -t nat -F "$NAT_CHAIN" 2>/dev/null
+	iptables -t nat -X "$NAT_CHAIN" 2>/dev/null
+	iptables -t nat -F "$NAT_UDP_CHAIN" 2>/dev/null
+	iptables -t nat -X "$NAT_UDP_CHAIN" 2>/dev/null
+	iptables -F "$FILT_CHAIN" 2>/dev/null
+	iptables -X "$FILT_CHAIN" 2>/dev/null
+}
+
+# tproxy_family_clean $ipt $div $chain $with_udp
+tproxy_family_clean() {
+	local ipt="$1" div="$2" chain="$3" with_udp="$4"
+	while $ipt -t mangle -D PREROUTING -p tcp -j "$chain" 2>/dev/null; do :; done
+	if [ "$with_udp" = "1" ]; then
+		while $ipt -t mangle -D PREROUTING -p udp -j "$chain" 2>/dev/null; do :; done
+	fi
+	while $ipt -t mangle -D PREROUTING -p tcp -m socket -j "$div" 2>/dev/null; do :; done
+	$ipt -t mangle -F "$chain" 2>/dev/null
+	$ipt -t mangle -X "$chain" 2>/dev/null
+	$ipt -t mangle -F "$div" 2>/dev/null
+	$ipt -t mangle -X "$div" 2>/dev/null
+}
+
+stop_tproxy_firewall() {
+	local with_udp=0
+	[ "$ENABLE_UDP" = "1" ] && with_udp=1
+
+	tproxy_family_clean iptables "$DIV_CHAIN" "$TP_CHAIN" "$with_udp"
+	if command -v ip6tables >/dev/null 2>&1; then
+		tproxy_family_clean ip6tables "$DIV6_CHAIN" "$TP6_CHAIN" "$with_udp"
+		while ip6tables -D FORWARD -j "$FILT6_CHAIN" 2>/dev/null; do :; done
+		ip6tables -F "$FILT6_CHAIN" 2>/dev/null
+		ip6tables -X "$FILT6_CHAIN" 2>/dev/null
+	fi
+	while iptables -D FORWARD -j "$FILT_CHAIN" 2>/dev/null; do :; done
+	iptables -F "$FILT_CHAIN" 2>/dev/null
+	iptables -X "$FILT_CHAIN" 2>/dev/null
+
+	# 策略路由保留不删（可能被其他服务复用）；如需彻底清除：
+	# ip rule del fwmark $TPROXY_MARK table $TPROXY_TABLE
+	# ip route del local 0.0.0.0/0 dev lo table $TPROXY_TABLE
+	# ip -6 rule del fwmark $TPROXY_MARK table $TPROXY_TABLE
+	# ip -6 route del local ::/0 dev lo table $TPROXY_TABLE
 }

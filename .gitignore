@@ -1,5 +1,9 @@
 # Binaries
 domain-socks
+*.exe
+
+# Runtime logs
+default_*.log
 
 # OS & Editor
 .DS_Store

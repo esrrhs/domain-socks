@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
 	ghdns "github.com/esrrhs/gohome/dns"
+	"github.com/miekg/dns"
 )
 
 func TestSplitRoutingWithGohome(t *testing.T) {
@@ -207,4 +211,300 @@ func TestSocks5AuthServer(t *testing.T) {
 		t.Fatalf("socksConnect with user/pass failed: %v", err)
 	}
 	conn.Close()
+}
+
+// stubExchangeResolver 只实现 AAAA 过滤测试关心的两个方法，
+// 其余方法通过内嵌 nil 接口在被误调用时直接 panic，暴露测试问题。
+type stubExchangeResolver struct {
+	ghdns.Resolver
+	proxyDomains map[string]bool
+	upstreamHits int
+}
+
+func (s *stubExchangeResolver) ShouldProxy(target string) (bool, error) {
+	return s.proxyDomains[target], nil
+}
+
+func (s *stubExchangeResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	s.upstreamHits++
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	if len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA {
+		resp.Answer = append(resp.Answer, &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+			AAAA: net.ParseIP("2001:db8::1"),
+		})
+	}
+	return resp, nil
+}
+
+func TestAAAAFilter(t *testing.T) {
+	stub := &stubExchangeResolver{proxyDomains: map[string]bool{"www.google.com": true}}
+	f := &aaaaFilter{Resolver: stub}
+
+	// 代理域名 AAAA：返回空 NOERROR，且不得透传到上游（防 IPv6 泄漏）
+	req := new(dns.Msg)
+	req.SetQuestion("www.google.com.", dns.TypeAAAA)
+	resp, err := f.Exchange(context.Background(), req)
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
+		t.Fatalf("expected empty NOERROR for proxy AAAA, rcode=%d answers=%d", resp.Rcode, len(resp.Answer))
+	}
+	if stub.upstreamHits != 0 {
+		t.Fatalf("proxy AAAA must not reach upstream, hits=%d", stub.upstreamHits)
+	}
+
+	// 直连域名 AAAA：正常透传，保留双栈
+	req2 := new(dns.Msg)
+	req2.SetQuestion("www.baidu.com.", dns.TypeAAAA)
+	resp2, err := f.Exchange(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("direct AAAA exchange: %v", err)
+	}
+	if len(resp2.Answer) != 1 {
+		t.Fatalf("direct AAAA should pass through, answers=%d", len(resp2.Answer))
+	}
+
+	// A 查询始终透传
+	reqA := new(dns.Msg)
+	reqA.SetQuestion("www.google.com.", dns.TypeA)
+	if _, err := f.Exchange(context.Background(), reqA); err != nil {
+		t.Fatalf("A exchange: %v", err)
+	}
+	if stub.upstreamHits != 2 {
+		t.Fatalf("A query must pass through, upstream hits=%d", stub.upstreamHits)
+	}
+}
+
+// TestPeekHostFragmentedTLS 验证 ClientHello 被 TCP 拆成多个段到达时，
+// peekHost 仍能还原完整 SNI，且返回的 prefix 不丢字节（后续要原样转发）。
+func TestPeekHostFragmentedTLS(t *testing.T) {
+	pkt := craftClientHello("www.youtube.com")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		s, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer s.Close()
+		// 先只发 TLS record 头的前 3 字节，再发剩余部分
+		_, _ = s.Write(pkt[:3])
+		time.Sleep(30 * time.Millisecond)
+		_, _ = s.Write(pkt[3:])
+		time.Sleep(200 * time.Millisecond)
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	prefix, host := peekHost(c)
+	if host != "www.youtube.com" {
+		t.Fatalf("expected sni www.youtube.com, got %q", host)
+	}
+	if !bytes.Equal(prefix, pkt) {
+		t.Fatalf("prefix mismatch: got %d bytes, want %d bytes", len(prefix), len(pkt))
+	}
+}
+
+// TestPeekHostNonHTTPFastReturn 验证非 HTTP(S) 协议（如 SSH 服务器 banner）
+// 不会被 250ms 嗅探超时拖慢：首包到达即判定并返回。
+func TestPeekHostNonHTTPFastReturn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		s, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer s.Close()
+		_, _ = s.Write([]byte("SSH-2.0-OpenSSH_9.7\r\n"))
+		time.Sleep(300 * time.Millisecond)
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	start := time.Now()
+	prefix, host := peekHost(c)
+	elapsed := time.Since(start)
+	if host != "" {
+		t.Fatalf("ssh banner must not yield a host, got %q", host)
+	}
+	if len(prefix) == 0 {
+		t.Fatal("prefix should carry the already-read banner bytes")
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("non-HTTP protocol should bail out immediately, took %v", elapsed)
+	}
+}
+
+// TestPeekHostFragmentedHTTP 验证 HTTP 请求头跨段时仍能嗅探 Host。
+func TestPeekHostFragmentedHTTP(t *testing.T) {
+	full := []byte("GET /index.html HTTP/1.1\r\nHost: www.example.cn\r\nAccept: */*\r\n\r\n")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		s, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer s.Close()
+		_, _ = s.Write(full[:7])
+		time.Sleep(30 * time.Millisecond)
+		_, _ = s.Write(full[7:])
+		time.Sleep(200 * time.Millisecond)
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	prefix, host := peekHost(c)
+	if host != "www.example.cn" {
+		t.Fatalf("expected www.example.cn, got %q", host)
+	}
+	if !bytes.Equal(prefix, full) {
+		t.Fatalf("prefix lost bytes: got %d want %d", len(prefix), len(full))
+	}
+}
+
+func TestSniffConclusive(t *testing.T) {
+	cases := []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{"empty", nil, false},
+		{"tls first byte only", []byte{0x16}, false},
+		{"tls second byte not ssl3", []byte{0x16, 0x01, 0x00}, true},
+		{"tls header partial", []byte{0x16, 0x03, 0x01, 0x00}, false},
+		{"http method prefix", []byte("GE"), false},
+		{"http garbage prefix", []byte("XYZ"), true},
+		{"http headers complete", []byte("GET / HTTP/1.1\r\nHost: a.com\r\n\r\n"), true},
+		{"http headers partial", []byte("GET / HTTP/1.1\r\nHost: a.com\r\n"), false},
+	}
+	for _, tc := range cases {
+		if got := sniffConclusive(tc.b); got != tc.want {
+			t.Errorf("%s: sniffConclusive=%v want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// 完整 TLS record（无 SNI 也应下结论），截断的 record 必须继续等待
+	pkt := craftClientHello("x.test")
+	if !sniffConclusive(pkt) {
+		t.Error("complete client hello should be conclusive")
+	}
+	recLen := int(pkt[3])<<8 | int(pkt[4])
+	if sniffConclusive(pkt[:4+recLen]) {
+		t.Error("truncated client hello should wait for more bytes")
+	}
+}
+
+func TestDNSListenCandidates(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"[::]:1053", []string{"[::]:1053", "0.0.0.0:1053"}},
+		{":1053", []string{"[::]:1053", "0.0.0.0:1053"}},
+		{"0.0.0.0:1053", []string{"[::]:1053", "0.0.0.0:1053"}},
+		{"127.0.0.1:1053", []string{"127.0.0.1:1053"}},
+		{"192.168.1.1:53", []string{"192.168.1.1:53"}},
+		{"[::1]:1053", []string{"[::1]:1053"}},
+		{"garbage", []string{"garbage"}},
+	}
+	for _, tc := range cases {
+		got := dnsListenCandidates(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("dnsListenCandidates(%q) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("dnsListenCandidates(%q) = %v, want %v", tc.in, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+// ipv6LoopbackAvailable 判断本机是否真的能在 ::1 上收包
+// （部分精简容器只有 v4 loopback）。
+func ipv6LoopbackAvailable() bool {
+	c, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: 0})
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+func dnsQueryLoopback(t *testing.T, addr string) {
+	t.Helper()
+	c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
+	m := new(dns.Msg)
+	m.SetQuestion("example.org.", dns.TypeA)
+	resp, _, err := c.Exchange(m, addr)
+	if err != nil {
+		t.Fatalf("dns query via %s: %v", addr, err)
+	}
+	if resp == nil || resp.Rcode != dns.RcodeSuccess {
+		t.Fatalf("dns query via %s: bad response %v", addr, resp)
+	}
+}
+
+// freeDualStackPort 预占一个 [::] 空闲端口并立即释放：
+// ghdns.Server 不暴露实际绑定地址，无法从 :0 反查分配到的端口。
+func freeDualStackPort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "[::]:0")
+	if err != nil {
+		t.Fatalf("probe free dual-stack port: %v", err)
+	}
+	port := c.LocalAddr().(*net.UDPAddr).Port
+	_ = c.Close()
+	return port
+}
+
+// TestStartDNSDualStack 验证默认的 [::]:port 单 socket 在双栈内核上同时
+// 接收 v4(127.0.0.1) 与 v6(::1) 查询——这是两族 nat REDIRECT 能
+// 共用一个 DNS 端口的前提。无 v6 loopback 的环境只断言 v4。
+func TestStartDNSDualStack(t *testing.T) {
+	port := freeDualStackPort(t)
+	stub := &stubExchangeResolver{}
+	srv, _, err := startDNS(stub, fmt.Sprintf("[::]:%d", port))
+	if err != nil {
+		t.Fatalf("startDNS dual-stack: %v", err)
+	}
+	defer srv.Stop()
+
+	dnsQueryLoopback(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if ipv6LoopbackAvailable() {
+		dnsQueryLoopback(t, net.JoinHostPort("::1", strconv.Itoa(port)))
+	} else {
+		t.Log("IPv6 loopback unavailable, skip ::1 query")
+	}
 }

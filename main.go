@@ -2,27 +2,56 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ghdns "github.com/esrrhs/gohome/dns"
+	"github.com/miekg/dns"
 )
+
+// shutdownDrainTimeout 限制优雅退出时等待在途连接收尾的最长时间
+const shutdownDrainTimeout = 3 * time.Second
 
 func main() {
 	socks := flag.String("socks", "192.168.1.101:1081", "upstream socks5")
 	socksUser := flag.String("socks-user", "", "upstream socks5 username")
 	socksPass := flag.String("socks-pass", "", "upstream socks5 password")
-	dnsAddr := flag.String("dns", "127.0.0.1:1053", "dns listen address")
+	dnsAddr := flag.String("dns", "[::]:1053", "dns listen address; wildcard listens dual-stack (v4+v6) and falls back to v4-only if the kernel lacks IPv6")
 	listen := flag.String("listen", "0.0.0.0:12345", "transparent redirect listen")
 	directDNS := flag.String("direct-dns", "223.5.5.5:53,119.29.29.29:53", "domestic upstream DNS servers (comma-separated)")
 	directDomainsFile := flag.String("direct-domains-file", "", "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
+	proxyDomainsFile := flag.String("proxy-domains-file", "", "optional file containing extra proxy domains (e.g. dnsmasq format or line list)")
+	geoipFile := flag.String("geoip", "", "optional GeoLite2-Country.mmdb path for IP-based CN split routing")
+	disableAAAA := flag.Bool("disable-aaaa", true, "answer AAAA queries of proxy domains with empty NOERROR to prevent IPv6 bypass leak")
+	udpListen := flag.String("udplisten", "", "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
+	tproxyListen := flag.String("tproxy", "", "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
+	udpTProxy := flag.String("udp-tproxy", "", "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
 	flag.Parse()
+
+	listenExplicitlySet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "listen" {
+			listenExplicitlySet = true
+		}
+	})
+	if *tproxyListen != "" && listenExplicitlySet {
+		log.Fatal("-tproxy is mutually exclusive with -listen (choose one TCP interception mode)")
+	}
+	if *udpTProxy != "" && *udpListen != "" {
+		log.Fatal("-udp-tproxy is mutually exclusive with -udplisten (choose one UDP interception mode)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// 1. 初始化 gohome DNS Resolver 配置
 	cfg := ghdns.DefaultConfig()
@@ -33,43 +62,169 @@ func main() {
 	if *directDomainsFile != "" {
 		cfg.DirectDomainFiles = []string{*directDomainsFile}
 	}
+	if *proxyDomainsFile != "" {
+		cfg.ProxyDomainFiles = []string{*proxyDomainsFile}
+	}
+	if *geoipFile != "" {
+		cfg.GeoIPFile = *geoipFile
+	}
 
 	resolver, err := ghdns.NewResolver(cfg)
 	if err != nil {
 		log.Fatalf("init resolver failed: %v", err)
 	}
 
-	// 2. 启动 DNS 服务端
-	dnsServer := ghdns.NewServer(*dnsAddr, resolver)
-	if err := dnsServer.Start(); err != nil {
-		log.Fatalf("start dns server on %s failed: %v", *dnsAddr, err)
+	// 2. 包装 Resolver：过滤代理域名的 AAAA，防止客户端走真实 IPv6 绕过透明代理
+	var r ghdns.Resolver = resolver
+	if *disableAAAA {
+		r = &aaaaFilter{Resolver: r}
 	}
-	defer dnsServer.Stop()
 
-	log.Printf("domain-socks started: socks=%s dns=%s listen=%s", *socks, *dnsAddr, *listen)
-
-	// 3. 监听透明重定向连接
-	ln, err := net.Listen("tcp", *listen)
+	// 3. 启动 DNS 服务端（双栈监听，使 v4/v6 的 nat REDIRECT 都能送达）
+	dnsServer, dnsBoundAddr, err := startDNS(r, *dnsAddr)
 	if err != nil {
-		log.Fatalf("listen tcp %s: %v", *listen, err)
+		log.Fatalf("%v", err)
 	}
-	for {
-		c, err := ln.Accept()
+
+	// 4. 监听透明入向 TCP：REDIRECT（v4，SO_ORIGINAL_DST）或 TPROXY（双栈）
+	var (
+		ln    net.Listener
+		lnErr error
+	)
+	tcpMode := "redirect"
+	if *tproxyListen != "" {
+		ln, lnErr = startTCPTProxy(*tproxyListen)
+		tcpMode = "tproxy"
+	} else {
+		ln, lnErr = net.Listen("tcp", *listen)
+	}
+	if lnErr != nil {
+		log.Fatalf("listen tcp failed: %v", lnErr)
+	}
+
+	// 5. UDP 透明转发（默认关闭）：REDIRECT（v4）或 TPROXY（双栈），
+	// 需配合对应防火墙规则显式启用
+	gw := newUDPGateway(r, *socks, *socksUser, *socksPass)
+	gwCtx, gwCancel := context.WithCancel(context.Background())
+	defer gwCancel()
+	go gw.run(gwCtx)
+
+	var stopUDP func()
+	udpMode := "off"
+	switch {
+	case *udpTProxy != "":
+		stop, err := startUDPTProxy(*udpTProxy, gw)
 		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
+			log.Fatalf("start udp tproxy on %s failed: %v", *udpTProxy, err)
 		}
-		go handleConn(c, resolver, *socks, *socksUser, *socksPass)
+		stopUDP = stop
+		udpMode = "tproxy=" + *udpTProxy
+		log.Printf("udp relay enabled: udp-tproxy=%s -> socks=%s", *udpTProxy, *socks)
+	case *udpListen != "":
+		stop, err := startUDPFrontend(*udpListen, gw)
+		if err != nil {
+			log.Fatalf("start udp frontend on %s failed: %v", *udpListen, err)
+		}
+		stopUDP = stop
+		udpMode = "redirect=" + *udpListen
+		log.Printf("udp relay enabled: udplisten=%s -> socks=%s", *udpListen, *socks)
 	}
+
+	tcpListenDesc := *listen
+	if *tproxyListen != "" {
+		tcpListenDesc = *tproxyListen
+	}
+	log.Printf("domain-socks started: socks=%s dns=%s tcp(%s)=%s aaaa-filter=%v udp=%s",
+		*socks, dnsBoundAddr, tcpMode, tcpListenDesc, *disableAAAA, udpMode)
+
+	// REDIRECT 模式需 SO_ORIGINAL_DST 反查（v4）；TPROXY 不做 NAT，
+	// 已 accept 连接的 LocalAddr 即原始目标（天然支持 v4/v6）。
+	dstOf := originalDst
+	if *tproxyListen != "" {
+		dstOf = localDst
+	}
+
+	var wg sync.WaitGroup
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf)
+			}()
+		}
+	}()
+
+	// 6. 等待退出信号并优雅关闭
+	<-ctx.Done()
+	log.Printf("shutdown signal received, draining connections...")
+	if stopUDP != nil {
+		stopUDP()
+	}
+	gwCancel()
+	gw.Close()
+	_ = ln.Close()
+	_ = dnsServer.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainTimeout):
+		log.Printf("drain timeout (%v), forcing exit with active connections", shutdownDrainTimeout)
+	}
+	_ = resolver.Close()
 }
 
-func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string) {
+// aaaaFilter 包装 gohome Resolver：对判定走代理的域名，AAAA 查询直接返回空
+// NOERROR 响应，迫使客户端回退到 A 记录（Fake-IP），避免客户端拿到真实 IPv6
+// 后绕过仅劫持 TCP/IPv4 的透明代理造成流量泄漏。直连域名的 AAAA 正常透传，
+// 保留国内双栈访问能力。ShouldProxy 出错时 gohome 默认按代理处理，同样过滤。
+type aaaaFilter struct {
+	ghdns.Resolver
+}
+
+func (f *aaaaFilter) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	if req != nil && len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA {
+		name := strings.TrimSuffix(req.Question[0].Name, ".")
+		if proxy, _ := f.Resolver.ShouldProxy(name); proxy {
+			resp := new(dns.Msg)
+			resp.SetReply(req)
+			return resp, nil
+		}
+	}
+	return f.Resolver.Exchange(ctx, req)
+}
+
+// dstResolver 从已截获的连接上取原始目标：REDIRECT 用 SO_ORIGINAL_DST
+// （redirect_linux.go），TPROXY 直接读 LocalAddr。
+type dstResolver func(c net.Conn) (net.IP, int, error)
+
+// localDst 用于 TPROXY：TPROXY 不做 NAT，accept 连接的本地端地址
+// 就是客户端最初访问的目标。v4-mapped 统一成 4 字节 v4。
+func localDst(c net.Conn) (net.IP, int, error) {
+	ta, ok := c.LocalAddr().(*net.TCPAddr)
+	if !ok || ta == nil {
+		return nil, 0, fmt.Errorf("local dst: unexpected addr type %T", c.LocalAddr())
+	}
+	return canonicalIP(ta.IP), ta.Port, nil
+}
+
+func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver) {
 	defer c.Close()
-	dstIP, dstPort, err := originalDst(c)
+	dstIP, dstPort, err := dstOf(c)
 	if err != nil {
-		log.Printf("original dst: %v", err)
+		log.Printf("resolve original dst: %v", err)
 		return
 	}
+	dstIP = canonicalIP(dstIP)
 
 	isFake := resolver.IsFakeIP(dstIP)
 	var domain string
@@ -207,6 +362,41 @@ func captiveProbe(prefix []byte, domain string) bool {
 	return false
 }
 
+// dnsListenCandidates 返回 DNS 监听地址的尝试顺序。
+// 通配配置（host 为空 / "::" / "0.0.0.0"）优先绑定 [::]:port：Linux/macOS
+// 默认双栈语义下这一个 socket 同时接收 v4 与 v6（v4 以 v4-mapped 到达），
+// 可同时接住两族 nat REDIRECT 转来的 DNS 报文；内核无 IPv6 栈时绑定失败，
+// 回退 v4 通配。显式指定的具体地址（如 127.0.0.1）原样使用，不扩大范围。
+func dnsListenCandidates(addr string) []string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return []string{addr}
+	}
+	switch host {
+	case "", "::", "0.0.0.0":
+		return []string{net.JoinHostPort("::", port), net.JoinHostPort("0.0.0.0", port)}
+	default:
+		return []string{addr}
+	}
+}
+
+// startDNS 按 dnsListenCandidates 的顺序尝试启动 DNS 服务，
+// 返回成功运行的 server 与其实际绑定地址。
+func startDNS(r ghdns.Resolver, addr string) (*ghdns.Server, string, error) {
+	candidates := dnsListenCandidates(addr)
+	var errs []string
+	for _, candidate := range candidates {
+		srv := ghdns.NewServer(candidate, r)
+		if err := srv.Start(); err == nil {
+			log.Printf("dns server listening on %s (udp+tcp)", candidate)
+			return srv, candidate, nil
+		} else {
+			errs = append(errs, fmt.Sprintf("%s: %v", candidate, err))
+		}
+	}
+	return nil, "", fmt.Errorf("start dns server failed (%s)", strings.Join(errs, "; "))
+}
+
 func setKeepAlive(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
@@ -225,15 +415,31 @@ func closeWrite(c net.Conn) {
 	_ = tc.CloseWrite()
 }
 
+// peekHost 在有限时间内读取连接前缀，尝试嗅探 TLS SNI 或 HTTP Host。
+// 采用循环读取以容忍 ClientHello / HTTP 请求头的 TCP 分段；一旦能确定
+// 域名、或确认数据不属于 HTTP(S)、或等待超时，立即返回，避免给 SSH 等
+// "服务器先说话"协议增加固定延迟。返回的 prefix 是已读全部字节，
+// 调用方必须原样转发给上游，不能丢字节。
 func peekHost(c net.Conn) ([]byte, string) {
-	_ = c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	_ = c.SetReadDeadline(time.Now().Add(sniffTimeout))
+	defer c.SetReadDeadline(time.Time{})
+
+	var prefix []byte
 	buf := make([]byte, 2048)
-	n, _ := c.Read(buf)
-	_ = c.SetReadDeadline(time.Time{})
-	if n <= 0 {
-		return nil, ""
+	for len(prefix) < sniffMaxBytes {
+		n, err := c.Read(buf)
+		if n > 0 {
+			prefix = append(prefix, buf[:n]...)
+			if host := sniffHost(prefix); host != "" {
+				return prefix, strings.TrimSuffix(strings.ToLower(host), ".")
+			}
+			if sniffConclusive(prefix) {
+				return prefix, ""
+			}
+		}
+		if err != nil {
+			break
+		}
 	}
-	prefix := append([]byte(nil), buf[:n]...)
-	host := strings.TrimSuffix(strings.ToLower(sniffHost(prefix)), ".")
-	return prefix, host
+	return prefix, ""
 }

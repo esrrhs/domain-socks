@@ -880,6 +880,20 @@ func TestTopHTTPEndpoint(t *testing.T) {
 	}
 }
 
+// stripLiveMetrics 剔除两个实时 runtime gauge 的样本行：uptime 可能跨秒、
+// 并发测试会改变 goroutine 数，都是合法活值，不能参与渲染确定性比较。
+func stripLiveMetrics(in string) string {
+	var out []string
+	for _, ln := range strings.Split(in, "\n") {
+		if strings.HasPrefix(ln, promPrefix+"uptime_seconds ") ||
+			strings.HasPrefix(ln, promPrefix+"goroutines ") {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
+}
+
 // parsePromLines 极简解析 /metrics：返回 sample[name+labels]=value，
 // typ[name]=类型，help 存在性单独检查。
 func parsePromLines(t *testing.T, body string) (map[string]string, map[string]string, int) {
@@ -1001,18 +1015,7 @@ func TestPrometheusExposition(t *testing.T) {
 
 	// 输出确定性：族顺序/格式必须稳定。剔除两个实时 runtime gauge
 	// 的样本行（uptime 跨秒、并发测试改变 goroutine 数都是合法活值）。
-	stripLive := func(in string) string {
-		var out []string
-		for _, ln := range strings.Split(in, "\n") {
-			if strings.HasPrefix(ln, promPrefix+"uptime_seconds ") ||
-				strings.HasPrefix(ln, promPrefix+"goroutines ") {
-				continue
-			}
-			out = append(out, ln)
-		}
-		return strings.Join(out, "\n")
-	}
-	if stripLive(body) != stripLive(s.renderPrometheus()) {
+	if stripLiveMetrics(body) != stripLiveMetrics(s.renderPrometheus()) {
 		t.Fatal("prometheus render is not deterministic")
 	}
 
@@ -1103,7 +1106,7 @@ func TestPrometheusTopExport(t *testing.T) {
 		t.Fatalf("domain labeled samples=%d exceeds bound %d", labeled, 4*aggTopN)
 	}
 
-	if body != s.renderPrometheus() {
+	if stripLiveMetrics(body) != stripLiveMetrics(s.renderPrometheus()) {
 		t.Fatal("top export rendering is not deterministic")
 	}
 }

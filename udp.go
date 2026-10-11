@@ -50,6 +50,13 @@ type udpFlow struct {
 	target    string // host:port，与上游回包头中的地址严格一致
 	reply     func([]byte) error
 	lastSeen  time.Time
+
+	// /top 聚合在 flow 过期/关闭时一次性 flush（非每包加锁）：
+	// host 是还原出的域名或目标 IP，via 为 socks/direct，
+	// up/down 仅统计成功转发/成功回送的载荷字节。
+	host     string
+	via      string
+	up, down int64
 }
 
 // udpGateway 串起平台无关的数据面：分流判定 -> 代理/直连 relay ->
@@ -100,11 +107,13 @@ func (g *udpGateway) run(ctx context.Context) {
 
 func (g *udpGateway) sweep() {
 	var releases []func()
+	var flushed []*udpFlow
 	g.mu.Lock()
 	now := time.Now()
 	for key, f := range g.flows {
 		if now.Sub(f.lastSeen) > udpFlowIdle {
 			delete(g.flows, key)
+			flushed = append(flushed, f)
 		}
 	}
 	for key, c := range g.clients {
@@ -116,9 +125,42 @@ func (g *udpGateway) sweep() {
 		}
 	}
 	g.mu.Unlock()
+	g.flushFlowStats(flushed)
 	for _, r := range releases {
 		r()
 	}
+}
+
+// clientHostFromKey 从 clientKey（生产环境为 ip:port）提取客户端 IP；
+// 测试桩等无端口形式原样返回，保证客户端聚合始终有键。
+func clientHostFromKey(key string) string {
+	if host, _, err := net.SplitHostPort(key); err == nil {
+		return host
+	}
+	return key
+}
+
+// flushFlowStats 把已终结（过期/网关关闭）的 UDP flow 累计值写入 /top
+// 聚合，每个 flow 只写一次。零流量 flow（建在转发失败前）不产生记录，
+// 与 TCP 拨号失败不聚合的口径一致。
+func (g *udpGateway) flushFlowStats(flows []*udpFlow) {
+	for _, f := range flows {
+		if f.up == 0 && f.down == 0 {
+			continue
+		}
+		g.stats.recordFlow(f.host, clientHostFromKey(f.clientKey), f.via, f.up, f.down)
+	}
+}
+
+// addFlowBytes 在转发/回送成功后累加 flow 字节。flow 可能恰好被
+// sweep 回收，本次值只计入全局字节计数而不入聚合（罕见竞态）。
+func (g *udpGateway) addFlowBytes(flowKey string, up, down int64) {
+	g.mu.Lock()
+	if f, ok := g.flows[flowKey]; ok {
+		f.up += up
+		f.down += down
+	}
+	g.mu.Unlock()
 }
 
 // canonicalIP 把 IPv4-mapped IPv6（::ffff:x.x.x.x，含 16 字节形式）统一成
@@ -178,8 +220,10 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 
 	flowKey = net.JoinHostPort(target, strconv.Itoa(dstPort))
 	kind := "D"
+	via := "direct"
 	if viaProxy {
 		kind = "P"
+		via = "socks"
 	}
 	fkey := kind + "|" + flowKey
 	g.mu.Lock()
@@ -201,6 +245,8 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 			target:    flowKey,
 			reply:     reply,
 			lastSeen:  time.Now(),
+			host:      target,
+			via:       via,
 		}
 	}
 	g.mu.Unlock()
@@ -218,7 +264,10 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 		if g.shouldLogFwdFail() {
 			log.Printf("udp forward fail %s -> %s: %v", c.addr, flowKey, err)
 		}
+		return
 	}
+	// 仅成功转发才计入 flow 上行（与 TCP 字节计数口径一致）
+	g.addFlowBytes(fkey, int64(len(data)), 0)
 }
 
 // shouldLogFwdFail 以 udpFwdFailLogInterval 为窗口限频转发失败日志。
@@ -274,6 +323,7 @@ func (g *udpGateway) deliverBack(flowKey string, data []byte) {
 	}
 	g.stats.inc(statUDPReplies)
 	g.stats.add(statUDPBytesOut, int64(len(data)))
+	g.addFlowBytes(flowKey, 0, int64(len(data)))
 }
 
 // activeCounts 返回瞬时活跃 client/flow 数（统计 gauge 用）
@@ -293,10 +343,17 @@ func (g *udpGateway) Close() {
 	}
 	g.closed = true
 	clients := g.clients
+	flows := g.flows
 	g.clients = make(map[string]*udpClient)
 	g.flows = make(map[string]*udpFlow)
 	g.mu.Unlock()
 
+	// 关闭即所有 UDP flow 终结：累计流量 flush 进 /top 聚合
+	flushed := make([]*udpFlow, 0, len(flows))
+	for _, f := range flows {
+		flushed = append(flushed, f)
+	}
+	g.flushFlowStats(flushed)
 	for _, c := range clients {
 		if c.release != nil {
 			c.release()

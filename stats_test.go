@@ -303,6 +303,30 @@ func TestStatsGatewayWiring(t *testing.T) {
 	if got := st.snapshot().Counters[statAssocDown]; got != 0 {
 		t.Fatalf("shutdown must not count as teardown, got %d", got)
 	}
+
+	// Close flush 了 UDP flow：/top 两张表都应含本次代理流量
+	drows := st.domains.top(10)
+	crows := st.clients.top(10)
+	var drow, crow *aggRow
+	for i := range drows {
+		if drows[i].key == "www.google.com" {
+			drow = &drows[i]
+		}
+	}
+	for i := range crows {
+		if crows[i].key == "lan-stats-1" {
+			crow = &crows[i]
+		}
+	}
+	if drow == nil {
+		t.Fatalf("udp flow domain missing from /top: %+v", drows)
+	}
+	if drow.conns != 1 || drow.proxy != 1 || drow.direct != 0 || drow.up != 4 || drow.down != 4 {
+		t.Fatalf("udp domain aggregate=%+v want conns/proxy=1 up/down=4", drow)
+	}
+	if crow == nil || crow.up != 4 || crow.down != 4 {
+		t.Fatalf("udp client aggregate=%+v want up/down=4", crow)
+	}
 }
 
 // mockSocks5TCP 是最小 SOCKS5 方法协商服务器，只握手不处理 CONNECT，

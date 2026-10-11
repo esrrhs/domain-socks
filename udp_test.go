@@ -586,3 +586,93 @@ func TestResolveRelayAddr(t *testing.T) {
 		t.Fatalf("explicit relay=%s err=%v", a2, err)
 	}
 }
+
+// TestUDPFlowAggregationFlush 验证 UDP flow 在空闲过期与网关关闭时
+// 把字节 flush 进 /top 聚合：直连路由、ip:port 客户端键提取、
+// 多 flow 累加到同一目标键，以及 flush 只发生一次。
+func TestUDPFlowAggregationFlush(t *testing.T) {
+	startEcho := func(t *testing.T) (*net.UDPConn, int) {
+		t.Helper()
+		ln, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 1500)
+			for {
+				n, src, err := ln.ReadFromUDP(buf)
+				if err != nil {
+					return
+				}
+				_, _ = ln.WriteToUDP(bytes.Clone(buf[:n]), src)
+			}
+		}()
+		return ln, ln.LocalAddr().(*net.UDPAddr).Port
+	}
+	echo1, port1 := startEcho(t)
+	defer echo1.Close()
+	echo2, port2 := startEcho(t)
+	defer echo2.Close()
+
+	cfg := ghdns.DefaultConfig()
+	cfg.EnableFakeIP = true
+	resolver, _ := ghdns.NewResolver(cfg)
+	gw := newUDPGateway(resolver, "127.0.0.1:1", "", "")
+	st := newStats()
+	gw.setStats(st)
+
+	reply := func(ch chan<- []byte) func([]byte) error {
+		return func(b []byte) error { ch <- b; return nil }
+	}
+	r1 := make(chan []byte, 4)
+	r2 := make(chan []byte, 4)
+	gw.handle([]byte("AAAAA"), "192.168.1.77:40001", net.IPv4(127, 0, 0, 1), port1, reply(r1), func() {})
+	gw.handle([]byte("BBB"), "192.168.1.77:40001", net.IPv4(127, 0, 0, 1), port2, reply(r2), func() {})
+	waitUDPReply(t, r1, "AAAAA")
+	waitUDPReply(t, r2, "BBB")
+
+	// 强制两条 flow 空闲过期后 sweep
+	gw.mu.Lock()
+	old := time.Now().Add(-(udpFlowIdle + time.Second))
+	for _, f := range gw.flows {
+		f.lastSeen = old
+	}
+	gw.mu.Unlock()
+	gw.sweep()
+
+	if n := len(gw.flows); n != 0 {
+		t.Fatalf("flows after sweep=%d want 0", n)
+	}
+	rows := st.domains.top(10)
+	var row *aggRow
+	for i := range rows {
+		if rows[i].key == "127.0.0.1" {
+			row = &rows[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("127.0.0.1 missing from /top: %+v", rows)
+	}
+	// 两条直连 flow 同目标 IP：conns=2，up=5+3=8，down=8
+	if row.conns != 2 || row.direct != 2 || row.proxy != 0 || row.up != 8 || row.down != 8 {
+		t.Fatalf("aggregated row=%+v want conns/direct=2 up/down=8", row)
+	}
+	// 客户端键必须去掉端口
+	crows := st.clients.top(10)
+	var crow *aggRow
+	for i := range crows {
+		if crows[i].key == "192.168.1.77" {
+			crow = &crows[i]
+		}
+	}
+	if crow == nil || crow.up != 8 || crow.down != 8 {
+		t.Fatalf("client rows=%+v want 192.168.1.77 up/down=8", crows)
+	}
+
+	// 再 sweep / Close 不得重复 flush
+	gw.sweep()
+	gw.Close()
+	if got := st.domains.top(10); got[0].conns != 2 {
+		t.Fatalf("double flush detected: %+v", got)
+	}
+}

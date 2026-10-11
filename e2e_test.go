@@ -321,6 +321,13 @@ func TestHandleConnByteCounting(t *testing.T) {
 	if hists[histTCPProxyDialSeconds].Count != 0 {
 		t.Fatalf("proxy dial histogram must stay zero, got %d", hists[histTCPProxyDialSeconds].Count)
 	}
+	// 关闭后流量必须进入 /top 聚合（回环场景 client 与 target 同为 127.0.0.1）
+	top := st.renderTop()
+	for _, want := range []string{"top domains", "top clients", "127.0.0.1"} {
+		if !strings.Contains(top, want) {
+			t.Fatalf("renderTop missing %q:\n%s", want, top)
+		}
+	}
 }
 
 // TestHandleConnProxyDialHistogram 走完整 handleConn 代理路径：真实

@@ -328,6 +328,10 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 			st.add(statTCPDirectBytesUp, up)
 			st.add(statTCPDirectBytesDown, down)
 		}
+		// /top 聚合：按目标域名(或 IP)与客户端 IP 各记一次
+		targetHost, _, _ := net.SplitHostPort(target)
+		clientHost, _, _ := net.SplitHostPort(client)
+		st.recordFlow(targetHost, clientHost, via, up, down)
 	}()
 
 	dstIP, dstPort, err := dstOf(c)

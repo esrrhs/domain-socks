@@ -125,6 +125,9 @@ type stats struct {
 
 	histograms map[string]*histogram
 	conns      *connTracker
+
+	domains *aggTable // 按目标域名/IP 聚合（连接关闭时记一次）
+	clients *aggTable // 按 LAN 客户端 IP 聚合
 }
 
 func newStats() *stats {
@@ -146,6 +149,8 @@ func newStats() *stats {
 		gauges:     make(map[string]func() int64),
 		histograms: make(map[string]*histogram, 2),
 		conns:      newConnTracker(),
+		domains:    newAggTable(aggCapDomains),
+		clients:    newAggTable(aggCapClients),
 	}
 	for _, k := range keys {
 		s.counters[k] = new(atomic.Int64)
@@ -300,6 +305,138 @@ func (s *stats) renderConns(now time.Time) string {
 			r.age.Round(time.Millisecond).String(), r.via, r.state,
 			r.client, r.target, humanBytes(r.up), humanBytes(r.down))
 	}
+	return b.String()
+}
+
+// 流量 Top 聚合：回答"哪个域名/哪台设备最耗流量"。仅在连接关闭时
+// 写一次（非每包热路径），map 有界，超限的新键折叠进 __other__，
+// 适合路由器长期运行不重置。
+const (
+	aggCapDomains = 8192
+	aggCapClients = 1024
+	aggTopN       = 20
+	aggOverflow   = "__other__"
+)
+
+type aggEntry struct {
+	conns  int64
+	proxy  int64 // 其中经 SOCKS5 转发的连接数
+	direct int64 // 其中直连的连接数
+	up     int64
+	down   int64
+}
+
+type aggRow struct {
+	key string
+	aggEntry
+}
+
+type aggTable struct {
+	cap int
+	mu  sync.Mutex
+	m   map[string]*aggEntry
+}
+
+func newAggTable(cap int) *aggTable {
+	return &aggTable{cap: cap, m: make(map[string]*aggEntry)}
+}
+
+// record 累加一条已关闭连接。key 为空（域名反查失败的兜底 unknown
+// 不聚合域名）时跳过；超限新键折叠进 aggOverflow。
+func (t *aggTable) record(key, via string, up, down int64) {
+	if t == nil || key == "" {
+		return
+	}
+	t.mu.Lock()
+	e, ok := t.m[key]
+	if !ok {
+		k := key
+		if len(t.m) >= t.cap {
+			k = aggOverflow
+			e, ok = t.m[k]
+		}
+		if !ok {
+			e = &aggEntry{}
+			t.m[k] = e
+		}
+	}
+	e.conns++
+	e.up += up
+	e.down += down
+	switch via {
+	case "socks":
+		e.proxy++
+	case "direct":
+		e.direct++
+	}
+	t.mu.Unlock()
+}
+
+// top 返回按总字节降序（并列按键名升序保证确定性）的前 n 行拷贝。
+func (t *aggTable) top(n int) []aggRow {
+	t.mu.Lock()
+	rows := make([]aggRow, 0, len(t.m))
+	for k, e := range t.m {
+		rows = append(rows, aggRow{key: k, aggEntry: *e})
+	}
+	t.mu.Unlock()
+	sort.Slice(rows, func(a, b int) bool {
+		ta, tb := rows[a].up+rows[a].down, rows[b].up+rows[b].down
+		if ta != tb {
+			return ta > tb
+		}
+		return rows[a].key < rows[b].key
+	})
+	if n < len(rows) {
+		rows = rows[:n]
+	}
+	return rows
+}
+
+// recordFlow 在连接关闭时按目标 host 与客户端 IP 各聚合一次。
+// nil stats 安全；仅 socks/direct 路由计入（dst-fail 无目标流量）。
+func (s *stats) recordFlow(targetHost, clientHost, via string, up, down int64) {
+	if s == nil || (via != "socks" && via != "direct") {
+		return
+	}
+	s.domains.record(targetHost, via, up, down)
+	s.clients.record(clientHost, via, up, down)
+}
+
+func renderAggSection(title string, rows []aggRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (top %d by total bytes, since start)\n", title, aggTopN)
+	if len(rows) == 0 {
+		b.WriteString("  (empty)\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "  %-32s %7s %7s %7s %10s %10s\n",
+		"NAME", "CONNS", "PROXY", "DIRECT", "UP", "DOWN")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "  %-32s %7d %7d %7d %10s %10s\n",
+			truncateForTable(r.key, 32), r.conns, r.proxy, r.direct,
+			humanBytes(r.up), humanBytes(r.down))
+	}
+	return b.String()
+}
+
+// truncateForTable 截断过长键名（域名），保留尾部通常更有区分度的部分。
+// 按 rune 截断，避免切断多字节字符产生非法 UTF-8。
+func truncateForTable(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n+1:])
+}
+
+func (s *stats) renderTop() string {
+	if s == nil {
+		return "top domains:\n  (empty)\ntop clients:\n  (empty)\n"
+	}
+	var b strings.Builder
+	b.WriteString(renderAggSection("top domains", s.domains.top(aggTopN)))
+	b.WriteString(renderAggSection("top clients", s.clients.top(aggTopN)))
 	return b.String()
 }
 
@@ -460,6 +597,12 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprint(w, s.renderConns(time.Now()))
 	})
+	// /top：按域名/客户端聚合的累计流量排行
+	mux.HandleFunc("/top", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprint(w, s.renderTop())
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -471,6 +614,6 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 			log.Printf("stats server: %v", err)
 		}
 	}()
-	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns)", ln.Addr())
+	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns /top)", ln.Addr())
 	return srv
 }

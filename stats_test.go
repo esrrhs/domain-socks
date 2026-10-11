@@ -741,3 +741,102 @@ func TestConnsHTTPEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestAggTable(t *testing.T) {
+	tb := newAggTable(3)
+
+	tb.record("a.com", "socks", 100, 200)
+	tb.record("a.com", "direct", 10, 20)
+	tb.record("b.com", "socks", 500, 500)
+	tb.record("c.com", "direct", 1, 1)
+	// 第 4 个新键超容量，折叠进 __other__
+	tb.record("d.com", "socks", 7, 7)
+	tb.record("e.com", "direct", 3, 3)
+
+	rows := tb.top(10)
+	if len(rows) != 4 { // a/b/c/__other__
+		t.Fatalf("rows=%d want 4 (3 keys + overflow)", len(rows))
+	}
+	if rows[0].key != "b.com" || rows[0].up+rows[0].down != 1000 {
+		t.Fatalf("top row=%+v want b.com/1000", rows[0])
+	}
+	var a, other aggRow
+	for _, r := range rows {
+		switch r.key {
+		case "a.com":
+			a = r
+		case aggOverflow:
+			other = r
+		}
+	}
+	if a.conns != 2 || a.proxy != 1 || a.direct != 1 || a.up != 110 || a.down != 220 {
+		t.Fatalf("a.com aggregate=%+v", a)
+	}
+	// d.com+e.com 都折叠进 __other__：2 条、proxy/direct 各 1
+	if other.conns != 2 || other.proxy != 1 || other.direct != 1 || other.up != 10 || other.down != 10 {
+		t.Fatalf("overflow aggregate=%+v", other)
+	}
+
+	// topN 截断
+	if got := tb.top(2); len(got) != 2 || got[0].key != "b.com" {
+		t.Fatalf("top(2)=%+v", got)
+	}
+
+	// 空键与 nil 表跳过；recordFlow 只收 socks/direct
+	tb.record("", "socks", 999, 999)
+	if len(tb.top(100)) != 4 {
+		t.Fatal("empty key must be dropped")
+	}
+	var nilTB *aggTable
+	nilTB.record("x", "socks", 1, 1) // 不 panic
+
+	s := newStats()
+	s.recordFlow("h.example", "192.168.1.5", "socks", 10, 20)
+	s.recordFlow("h.example", "192.168.1.5", "dst-fail", 9, 9) // 过滤
+	s.recordFlow("h.example", "192.168.1.5", "captive204", 9, 9)
+	var nilS *stats
+	nilS.recordFlow("h", "c", "socks", 1, 1) // 不 panic
+	dr := s.domains.top(10)
+	cr := s.clients.top(10)
+	if len(dr) != 1 || dr[0].conns != 1 || dr[0].proxy != 1 || dr[0].up != 10 {
+		t.Fatalf("domain rows=%+v", dr)
+	}
+	if len(cr) != 1 || cr[0].key != "192.168.1.5" || cr[0].conns != 1 {
+		t.Fatalf("client rows=%+v", cr)
+	}
+}
+
+func TestTopHTTPEndpoint(t *testing.T) {
+	s := newStats()
+	srv := startStatsServer("127.0.0.1:0", s, nil)
+	if srv == nil {
+		t.Fatal("stats server failed")
+	}
+	defer srv.Close()
+	base := "http://" + srv.Addr
+
+	resp, err := http.Get(base + "/top")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "top domains") ||
+		!strings.Contains(string(body), "top clients") ||
+		!strings.Contains(string(body), "(empty)") {
+		t.Fatalf("empty /top mismatch:\n%s", body)
+	}
+
+	s.recordFlow("heavy.example", "192.168.1.9", "socks", 3000, 7000)
+	resp2, err := http.Get(base + "/top")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	for _, want := range []string{"heavy.example", "192.168.1.9", "CONNS", "PROXY", "2.9KiB", "6.8KiB"} {
+		if !strings.Contains(string(tbl), want) {
+			t.Fatalf("/top missing %q:\n%s", want, tbl)
+		}
+	}
+}

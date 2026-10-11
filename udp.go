@@ -143,6 +143,7 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 	}
 	dstIP = canonicalIP(dstIP)
 	g.stats.inc(statUDPIn)
+	g.stats.add(statUDPBytesIn, int64(len(data)))
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
@@ -272,6 +273,7 @@ func (g *udpGateway) deliverBack(flowKey string, data []byte) {
 		return
 	}
 	g.stats.inc(statUDPReplies)
+	g.stats.add(statUDPBytesOut, int64(len(data)))
 }
 
 // activeCounts 返回瞬时活跃 client/flow 数（统计 gauge 用）

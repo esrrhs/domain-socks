@@ -42,15 +42,17 @@ domain-socks -socks <proxy_ip:port> -dns <dns_listen> -listen <redirect_listen>
 - `-udplisten`: Transparent UDP REDIRECT listen address for SOCKS5 UDP ASSOCIATE relay (IPv4 only; default: disabled; e.g. `0.0.0.0:12346`). Requires a matching `nat ... -p udp -j REDIRECT` rule — set `ENABLE_UDP=1` in the init script to install it
 - `-tproxy`: TCP TPROXY dual-stack listen address (default: disabled; e.g. `:12345`). Mutually exclusive with `-listen`; enables interception of native IPv6 traffic. Requires `mangle ... -j TPROXY` rules plus `fwmark` policy routing (see below)
 - `-udp-tproxy`: UDP TPROXY dual-stack listen address (default: disabled; e.g. `:12346`). Mutually exclusive with `-udplisten`; use together with `-tproxy` and `ENABLE_UDP=1` for IPv6 UDP relay
-- `-stats-addr`: Read-only runtime metrics endpoint (default: `127.0.0.1:18080`). `GET /` returns a human-readable snapshot, `GET /json` machine-readable JSON — TCP proxy/direct/failure counts and active-connection gauge, UDP packets in/out, ASSOCIATE establish/teardown/cooldown counts, active UDP clients/flows gauges, DNS total/AAAA queries, filtered AAAA, Fake-IP answer and upstream-error counts, plus uptime and goroutine count. Loopback-only by default; set empty to disable, or `0.0.0.0:18080` to expose to the LAN (no control surface, counters only)
+- `-stats-addr`: Read-only runtime metrics endpoint (default: `127.0.0.1:18080`). `GET /` returns a human-readable snapshot, `GET /json` machine-readable JSON — TCP proxy/direct/failure counts with per-route up/down byte totals and active-connection gauge, UDP packets in/out with payload byte totals, ASSOCIATE establish/teardown/cooldown counts, active UDP clients/flows gauges, DNS total/AAAA queries, filtered AAAA, Fake-IP answer and upstream-error counts, plus uptime and goroutine count. Loopback-only by default; set empty to disable, or `0.0.0.0:18080` to expose to the LAN (no control surface, counters only)
+- `-access-log`: Log one summary line per intercepted TCP connection when it closes (default enabled; `-access-log=false` silences). Example: `tcp 192.168.1.5:54321 -> www.google.com:443 via socks up 2.0KiB down 5.00MiB in 2.35s`; dial failures append ` fail: <error>` and use `via socks`/`direct`/`dst-fail`/`captive204` labels.
 
 Quick check on the router:
 
 ```bash
-curl -s http://127.0.0.1:18080/ | grep -E 'socks_fail|assoc_|forward_fail|dns_'
+curl -s http://127.0.0.1:18080/ | grep -E 'socks_fail|assoc_|forward_fail|dns_|bytes'
 # dns_fakeip_answers growing       => DNS hijack + fake-ip split routing works
 # dns_aaaa_filtered growing        => clients are forced back to IPv4 (no v6 leak)
 # sustained udp_assoc_teardown + socks_fail/forward_fail growth => upstream proxy unhealthy
+# tcp_proxy_bytes_* vs tcp_direct_bytes_* => how traffic actually splits
 ```
 
 ## Firewall Rules

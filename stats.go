@@ -39,6 +39,14 @@ const (
 	statDNSAAAAFiltered = "dns_aaaa_filtered"  // 代理域名 AAAA 被空 NOERROR 拦截数
 	statDNSFakeIP       = "dns_fakeip_answers" // 应答含 Fake-IP A 记录的响应数
 	statDNSErrors       = "dns_errors"         // 上游解析失败的查询数
+
+	// 字节量（按连接/报文汇总，非每包原子操作）
+	statTCPProxyBytesUp    = "tcp_proxy_bytes_up"   // 经 SOCKS5 上行（LAN->远端）
+	statTCPProxyBytesDown  = "tcp_proxy_bytes_down" // 经 SOCKS5 下行（远端->LAN）
+	statTCPDirectBytesUp   = "tcp_direct_bytes_up"
+	statTCPDirectBytesDown = "tcp_direct_bytes_down"
+	statUDPBytesIn         = "udp_bytes_in"  // LAN 入站报文载荷字节
+	statUDPBytesOut        = "udp_bytes_out" // 回送 LAN 的报文载荷字节
 )
 
 // stats 持有进程级数据面计数器。所有 inc 方法对 nil 接收者安全，
@@ -63,6 +71,9 @@ func newStats() *stats {
 		statAssocUp, statAssocDown, statAssocCool, statAssocBadPkt,
 		statDNSQueries, statDNSAAAA, statDNSAAAAFiltered,
 		statDNSFakeIP, statDNSErrors,
+		statTCPProxyBytesUp, statTCPProxyBytesDown,
+		statTCPDirectBytesUp, statTCPDirectBytesDown,
+		statUDPBytesIn, statUDPBytesOut,
 	}
 	s := &stats{
 		start:    time.Now(),
@@ -95,6 +106,16 @@ func (s *stats) inc(key string) {
 	}
 	if c := s.counters[key]; c != nil {
 		c.Add(1)
+	}
+}
+
+// add 批量累加（连接结束时汇总字节数用，避免每包一次原子操作）
+func (s *stats) add(key string, n int64) {
+	if s == nil || n == 0 {
+		return
+	}
+	if c := s.counters[key]; c != nil {
+		c.Add(n)
 	}
 }
 

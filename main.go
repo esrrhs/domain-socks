@@ -36,6 +36,7 @@ func main() {
 	tproxyListen := flag.String("tproxy", "", "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
 	udpTProxy := flag.String("udp-tproxy", "", "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
 	statsAddr := flag.String("stats-addr", "127.0.0.1:18080", "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
+	accessLog := flag.Bool("access-log", true, "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
 	flag.Parse()
 
 	listenExplicitlySet := false
@@ -166,7 +167,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf, appStats)
+				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf, appStats, *accessLog)
 			}()
 		}
 	}()
@@ -254,18 +255,82 @@ func localDst(c net.Conn) (net.IP, int, error) {
 	return canonicalIP(ta.IP), ta.Port, nil
 }
 
-func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver, st *stats) {
+// countingConn 包装 net.Conn，累计 Write 成功字节数。每个连接使用独立的
+// *int64，且两个方向各由一个固定 goroutine 写入，无需原子操作。
+type countingConn struct {
+	net.Conn
+	n *int64
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	*c.n += int64(n)
+	return n, err
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2fGiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2fMiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+// formatConnLine 生成连接结束时的一行访问日志。via 为路由标签
+// （socks/direct/captive204/dst-fail）；dialErr 非 nil 表示建连失败。
+func formatConnLine(client, target, via string, up, down int64, d time.Duration, dialErr error) string {
+	line := fmt.Sprintf("tcp %s -> %s via %s up %s down %s in %s",
+		client, target, via, humanBytes(up), humanBytes(down), d.Round(time.Millisecond))
+	if dialErr != nil {
+		line += " fail: " + dialErr.Error()
+	}
+	return line
+}
+
+func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver, st *stats, accessLog bool) {
 	defer c.Close()
 	st.inc(statTCPAccepted)
 	st.tcpConnOpened()
 	defer st.tcpConnClosed()
+
+	client := c.RemoteAddr().String()
+	start := time.Now()
+	var (
+		target  = "unknown"
+		via     string
+		dialErr error
+		upB     int64 // 客户端 -> 远端
+		downB   int64 // 远端 -> 客户端
+	)
+	// 统一的连接结束日志 + 字节汇总（defer 先于 c.Close() 执行）
+	defer func() {
+		if accessLog {
+			log.Print(formatConnLine(client, target, via, upB, downB, time.Since(start), dialErr))
+		}
+		switch via {
+		case "socks":
+			st.add(statTCPProxyBytesUp, upB)
+			st.add(statTCPProxyBytesDown, downB)
+		case "direct":
+			st.add(statTCPDirectBytesUp, upB)
+			st.add(statTCPDirectBytesDown, downB)
+		}
+	}()
+
 	dstIP, dstPort, err := dstOf(c)
 	if err != nil {
+		via = "dst-fail"
 		st.inc(statTCPDstFail)
-		log.Printf("resolve original dst: %v", err)
+		dialErr = err
 		return
 	}
 	dstIP = canonicalIP(dstIP)
+	target = net.JoinHostPort(dstIP.String(), fmt.Sprintf("%d", dstPort))
 
 	isFake := resolver.IsFakeIP(dstIP)
 	var domain string
@@ -285,6 +350,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 
 	// 针对网络连通性探测 (Captive portal probe) 快速响应 204
 	if dstPort == 80 && captiveProbe(prefix, domain) {
+		via = "captive204"
 		st.inc(statTCPCaptive)
 		_, _ = c.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
@@ -295,49 +361,47 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 	// 2. 若不是 Fake-IP 且属于直连目标 -> 直接 net.Dial 目标真实地址直连
 	shouldProxy := isFake
 	if !shouldProxy {
-		target := domain
-		if target == "" {
-			target = dstIP.String()
+		host := domain
+		if host == "" {
+			host = dstIP.String()
 		}
-		sp, _ := resolver.ShouldProxy(target)
+		sp, _ := resolver.ShouldProxy(host)
 		shouldProxy = sp
 	}
 
 	var up net.Conn
-	var how string
-	var targetDesc string
 
 	if shouldProxy {
-		targetDesc = domain
-		if targetDesc == "" {
-			targetDesc = dstIP.String()
-		}
-		how = "socks"
+		via = "socks"
 		up, err = socksConnect(proxy, domain, dstIP, dstPort, socksUser, socksPass)
 		if err != nil {
 			st.inc(statTCPSocksFail)
-			log.Printf("socks fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
+			dialErr = err
 			return
 		}
 		st.inc(statTCPProxy)
 	} else {
 		// 直连直达
-		targetDesc = dstIP.String()
-		how = "direct"
-		up, err = net.DialTimeout("tcp", net.JoinHostPort(targetDesc, fmt.Sprintf("%d", dstPort)), 8*time.Second)
+		via = "direct"
+		up, err = net.DialTimeout("tcp", target, 8*time.Second)
 		if err != nil {
 			st.inc(statTCPDirectFail)
-			log.Printf("direct fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
+			dialErr = err
 			return
 		}
 		st.inc(statTCPDirect)
 	}
 	defer up.Close()
 
-	log.Printf("conn ok [%s] %s -> %s:%d", how, c.RemoteAddr(), targetDesc, dstPort)
+	// 嗅探到域名后，访问日志用域名而非 IP/Fake-IP
+	if domain != "" {
+		target = net.JoinHostPort(domain, fmt.Sprintf("%d", dstPort))
+	}
 
+	upConn := countingConn{Conn: up, n: &upB}
+	downConn := countingConn{Conn: c, n: &downB}
 	if len(prefix) > 0 {
-		if _, err = up.Write(prefix); err != nil {
+		if _, err = upConn.Write(prefix); err != nil {
 			return
 		}
 	}
@@ -349,12 +413,12 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(up, c)
+		_, _ = io.Copy(upConn, c)
 		closeWrite(up)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c, up)
+		_, _ = io.Copy(downConn, upConn)
 		closeWrite(c)
 	}()
 	wg.Wait()

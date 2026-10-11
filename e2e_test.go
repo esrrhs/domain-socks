@@ -232,3 +232,84 @@ func TestE2ERouterFlow(t *testing.T) {
 		t.Fatalf("expected direct response, got: %s", string(respBuf[:n]))
 	}
 }
+
+// TestHandleConnByteCounting 走一遍真实 handleConn 直连路径，验证连接结束时
+// 上下行字节按路由汇总到统计计数器（prefix 重放字节计入上行）。
+func TestHandleConnByteCounting(t *testing.T) {
+	// 上游回显服务：读到 EOF 后回 "ECHO:" + 原文
+	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		all, _ := io.ReadAll(c)
+		_, _ = c.Write(append([]byte("ECHO:"), all...))
+	}()
+	upPort := upLn.Addr().(*net.TCPAddr).Port
+
+	// 前端模拟透明监听；dstOf 直接返回上游（无需 REDIRECT/TPROXY）
+	frontLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frontLn.Close()
+
+	res := &stubExchangeResolver{proxyDomains: map[string]bool{}}
+	st := newStats()
+	dstOf := func(net.Conn) (net.IP, int, error) {
+		return net.ParseIP("127.0.0.1"), upPort, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		c, err := frontLn.Accept()
+		if err != nil {
+			t.Errorf("front accept: %v", err)
+			close(done)
+			return
+		}
+		handleConn(c, res, "127.0.0.1:0", "", "", dstOf, st, false)
+		close(done)
+	}()
+
+	cc, err := net.DialTimeout("tcp", frontLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "HELLO-WORLD" // 非 HTTP/TLS 首字节，嗅探立即放弃，走 prefix 重放
+	if _, err := cc.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	_ = cc.(*net.TCPConn).CloseWrite()
+	reply, err := io.ReadAll(cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cc.Close()
+	<-done
+
+	if want := "ECHO:" + payload; string(reply) != want {
+		t.Fatalf("reply=%q want %q", reply, want)
+	}
+	snap := st.snapshot().Counters
+	if snap[statTCPDirect] != 1 {
+		t.Fatalf("tcp_direct=%d want 1", snap[statTCPDirect])
+	}
+	if snap[statTCPDirectBytesUp] != int64(len(payload)) {
+		t.Fatalf("direct up bytes=%d want %d (prefix replay must count)",
+			snap[statTCPDirectBytesUp], len(payload))
+	}
+	if want := int64(len("ECHO:") + len(payload)); snap[statTCPDirectBytesDown] != want {
+		t.Fatalf("direct down bytes=%d want %d", snap[statTCPDirectBytesDown], want)
+	}
+	// 直连路径不应产生代理字节计数
+	if snap[statTCPProxyBytesUp] != 0 || snap[statTCPProxyBytesDown] != 0 {
+		t.Fatalf("proxy byte counters must stay zero, got up=%d down=%d",
+			snap[statTCPProxyBytesUp], snap[statTCPProxyBytesDown])
+	}
+}

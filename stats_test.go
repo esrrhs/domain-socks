@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -16,7 +19,74 @@ func TestStatsNilSafe(t *testing.T) {
 	var s *stats
 	// 未绑定 stats 的数据面路径（历史构造、个别测试）不得 panic
 	s.inc(statTCPAccepted)
+	s.add(statTCPProxyBytesUp, 9999)
 	s.registerGauges(map[string]func() int64{"x": func() int64 { return 1 }})
+}
+
+func TestStatsAddBatch(t *testing.T) {
+	s := newStats()
+	s.add(statUDPBytesIn, 0) // 零增量不影响
+	s.add(statUDPBytesIn, 100)
+	s.add(statUDPBytesIn, 23)
+	if got := s.snapshot().Counters[statUDPBytesIn]; got != 123 {
+		t.Fatalf("udp bytes in=%d want 123", got)
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0B"}, {1023, "1023B"}, {1024, "1.0KiB"},
+		{1536, "1.5KiB"}, {1 << 20, "1.00MiB"}, {1 << 30, "1.00GiB"},
+	}
+	for _, tc := range cases {
+		if got := humanBytes(tc.n); got != tc.want {
+			t.Errorf("humanBytes(%d)=%q want %q", tc.n, got, tc.want)
+		}
+	}
+}
+
+func TestFormatConnLine(t *testing.T) {
+	line := formatConnLine("192.168.1.5:54321", "www.google.com:443", "socks",
+		2048, 5*1024*1024, 2350*time.Millisecond, nil)
+	for _, want := range []string{"192.168.1.5:54321", "www.google.com:443", "via socks",
+		"up 2.0KiB", "down 5.00MiB", "in 2.35s"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("line %q missing %q", line, want)
+		}
+	}
+	failLine := formatConnLine("1.2.3.4:1", "dead.host:443", "socks", 0, 0, time.Millisecond,
+		errors.New("dial tcp: i/o timeout"))
+	if !strings.Contains(failLine, "fail: dial tcp: i/o timeout") {
+		t.Fatalf("fail line missing error: %q", failLine)
+	}
+}
+
+// bufConn 是只实现 Write 的最小 net.Conn（其余方法经内嵌 nil 接口，
+// 本测试不会调用）
+type bufConn struct {
+	net.Conn
+	buf bytes.Buffer
+}
+
+func (b *bufConn) Write(p []byte) (int, error) { return b.buf.Write(p) }
+
+func TestCountingConn(t *testing.T) {
+	var n int64
+	raw := &bufConn{}
+	c := countingConn{Conn: raw, n: &n}
+
+	if k, err := c.Write([]byte("ping")); err != nil || k != 4 {
+		t.Fatalf("first write: k=%d err=%v", k, err)
+	}
+	if k, err := c.Write([]byte("pong")); err != nil || k != 4 {
+		t.Fatalf("second write: k=%d err=%v", k, err)
+	}
+	if n != 8 || raw.buf.String() != "pingpong" {
+		t.Fatalf("counted=%d underlying=%q", n, raw.buf.String())
+	}
 }
 
 func TestStatsCountersAndGauges(t *testing.T) {
@@ -163,6 +233,13 @@ func TestStatsGatewayWiring(t *testing.T) {
 	}
 	if snap.Counters[statUDPReplies] < 1 {
 		t.Fatalf("udp_replies=%d want >=1", snap.Counters[statUDPReplies])
+	}
+	// "PING" 4 字节入站、4 字节回包
+	if snap.Counters[statUDPBytesIn] < 4 {
+		t.Fatalf("udp_bytes_in=%d want >=4", snap.Counters[statUDPBytesIn])
+	}
+	if snap.Counters[statUDPBytesOut] < 4 {
+		t.Fatalf("udp_bytes_out=%d want >=4", snap.Counters[statUDPBytesOut])
 	}
 	if snap.Counters[statUDPFwdFail] != 0 {
 		t.Fatalf("unexpected forward failures: %d", snap.Counters[statUDPFwdFail])

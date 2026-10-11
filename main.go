@@ -42,7 +42,14 @@ func main() {
 	logFile := flag.String("log-file", "", "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
 	logMaxMB := flag.Int("log-max-mb", 1, "max size in MB of one log file before it is rotated to .1")
 	logBackups := flag.Int("log-backups", 3, "number of rotated backup files to keep (.1 newest .. .N oldest)")
+	showVersion := flag.Bool("version", false, "print the embedded build version (git commit) and exit")
 	flag.Parse()
+
+	// -version 只输出一行版本信息即退出，不初始化任何服务、不碰日志文件。
+	if *showVersion {
+		fmt.Println("domain-socks version " + readBuildInfo().versionString())
+		return
+	}
 
 	// 文件日志尽早启用：后续参数校验的 log.Fatal 也要落进文件。
 	// 打开失败只告警并退回 stderr-only，与 stats 绑定失败同策略。
@@ -62,6 +69,12 @@ func main() {
 			log.Printf("file logging enabled: %s (rotate at %dMiB, keep %d backups)", *logFile, *logMaxMB, *logBackups)
 		}
 	}
+
+	// 版本横幅紧跟日志初始化：写入历史日志文件的第一条有效信息就是
+	// "跑的是哪个提交"，post-mortem 翻旧日志先确认现场版本。
+	binInfo := readBuildInfo()
+	log.Printf("domain-socks version %s (go %s)", binInfo.versionString(),
+		nonEmpty(binInfo.goVersion, "unknown"))
 
 	listenExplicitlySet := false
 	flag.Visit(func(f *flag.Flag) {
@@ -177,6 +190,13 @@ func main() {
 	}
 	log.Printf("domain-socks started: socks=%s dns=%s tcp(%s)=%s aaaa-filter=%v udp=%s",
 		*socks, dnsBoundAddr, tcpMode, tcpListenDesc, *disableAAAA, udpMode)
+	// 生效配置单行回显（与上面的版本行一起写进历史日志），排查"配置没生效"
+	// 类问题时不用翻 init 脚本；只回显是否有认证与用户名，绝不输出密码。
+	statsOpt := nonEmpty(*statsAddr, "off")
+	log.Printf("config: auth=%s direct-dns=%q stats=%s access-log=%v geoip=%s lists direct=%q proxy=%q",
+		describeAuth(*socksUser), *directDNS, statsOpt, *accessLog,
+		nonEmpty(*geoipFile, "off"),
+		nonEmpty(*directDomainsFile, "-"), nonEmpty(*proxyDomainsFile, "-"))
 
 	// REDIRECT 模式需 SO_ORIGINAL_DST 反查（v4）；TPROXY 不做 NAT，
 	// 已 accept 连接的 LocalAddr 即原始目标（天然支持 v4/v6）。

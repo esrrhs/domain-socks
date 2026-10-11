@@ -387,7 +387,11 @@ func (r *udpProxyRelay) ensureAssoc() error {
 			// 本 goroutine 成为唯一建连者
 			r.creating = make(chan struct{})
 			r.mu.Unlock()
+			// 成功与失败都记录（慢握手/超时是 UDP 链路劣化信号）；
+			// 冷却快速失败在上方分支返回，不会混入这张图。
+			dialStart := time.Now()
 			err := r.buildAssoc()
+			r.stats.observe(histUDPAssocDialSeconds, time.Since(dialStart))
 			r.mu.Lock()
 			if err != nil {
 				r.cooldownUntil = time.Now().Add(udpAssocCooldown)

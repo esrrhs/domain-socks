@@ -270,6 +270,10 @@ func TestStatsGatewayWiring(t *testing.T) {
 	if snap.Counters[statAssocUp] != 1 {
 		t.Fatalf("assoc_established=%d want 1", snap.Counters[statAssocUp])
 	}
+	// 一次真实 ASSOCIATE 握手必须被延迟直方图记录
+	if h := snap.Histograms[histUDPAssocDialSeconds]; h.Count != 1 || h.SumSeconds <= 0 {
+		t.Fatalf("udp assoc dial histogram=%+v want count=1 sum>0", h)
+	}
 	if snap.Counters[statUDPReplies] < 1 {
 		t.Fatalf("udp_replies=%d want >=1", snap.Counters[statUDPReplies])
 	}
@@ -960,8 +964,20 @@ func TestPrometheusExposition(t *testing.T) {
 		}
 	}
 
-	// 输出确定性：连续两次渲染字节一致
-	if body != s.renderPrometheus() {
+	// 输出确定性：族顺序/格式必须稳定。剔除两个实时 runtime gauge
+	// 的样本行（uptime 跨秒、并发测试改变 goroutine 数都是合法活值）。
+	stripLive := func(in string) string {
+		var out []string
+		for _, ln := range strings.Split(in, "\n") {
+			if strings.HasPrefix(ln, promPrefix+"uptime_seconds ") ||
+				strings.HasPrefix(ln, promPrefix+"goroutines ") {
+				continue
+			}
+			out = append(out, ln)
+		}
+		return strings.Join(out, "\n")
+	}
+	if stripLive(body) != stripLive(s.renderPrometheus()) {
 		t.Fatal("prometheus render is not deterministic")
 	}
 

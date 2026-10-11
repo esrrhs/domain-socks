@@ -53,6 +53,7 @@ const (
 	// 延迟直方图（固定桶，单位秒；observe 传拨号耗时，成功/失败都记）
 	histTCPProxyDialSeconds  = "tcp_proxy_dial_seconds"  // SOCKS5 拨号+协商+CONNECT 总耗时
 	histTCPDirectDialSeconds = "tcp_direct_dial_seconds" // 直连 net.Dial 耗时
+	histUDPAssocDialSeconds  = "udp_assoc_dial_seconds"  // UDP ASSOCIATE 拨号+握手耗时
 )
 
 // dialBuckets 覆盖拨号延迟的关心区间：局域网 SOCKS5 通常 <10ms，
@@ -148,7 +149,7 @@ func newStats() *stats {
 		start:      time.Now(),
 		counters:   make(map[string]*atomic.Int64, len(keys)),
 		gauges:     make(map[string]func() int64),
-		histograms: make(map[string]*histogram, 2),
+		histograms: make(map[string]*histogram, 3),
 		conns:      newConnTracker(),
 		domains:    newAggTable(aggCapDomains),
 		clients:    newAggTable(aggCapClients),
@@ -158,6 +159,7 @@ func newStats() *stats {
 	}
 	s.histograms[histTCPProxyDialSeconds] = newHistogram(dialBuckets)
 	s.histograms[histTCPDirectDialSeconds] = newHistogram(dialBuckets)
+	s.histograms[histUDPAssocDialSeconds] = newHistogram(dialBuckets)
 	// 内部 gauge 直接注册
 	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
@@ -479,6 +481,7 @@ var metricHelp = map[string]string{
 	statUDPBytesOut:          "UDP payload bytes delivered back to LAN clients.",
 	histTCPProxyDialSeconds:  "Time spent in SOCKS5 dial+negotiate+CONNECT (incl. failures).",
 	histTCPDirectDialSeconds: "Time spent in direct TCP dial (incl. failures).",
+	histUDPAssocDialSeconds:  "Time spent in UDP ASSOCIATE dial+handshake (incl. failures; cooldown fast-fails excluded).",
 }
 
 func promHelp(key string) string {

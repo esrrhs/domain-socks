@@ -437,10 +437,16 @@ func TestAssocCooldown(t *testing.T) {
 	resolver, _ := ghdns.NewResolver(cfg)
 	gw := newUDPGateway(resolver, dead, "", "")
 	defer gw.Close()
+	st := newStats()
+	gw.setStats(st)
 	r := gw.proxy
 
 	if err := r.ensureAssoc(); err == nil {
 		t.Fatal("first attempt must fail against a dead proxy")
+	}
+	// 首次失败是一次真实拨号尝试：进入直方图（含失败）
+	if h := st.snapshot().Histograms[histUDPAssocDialSeconds]; h.Count != 1 {
+		t.Fatalf("after failed dial histogram count=%d want 1", h.Count)
 	}
 
 	// 冷却期内 10 个并发请求：全部快速失败，且不得产生新的 TCP 尝试
@@ -467,6 +473,10 @@ func TestAssocCooldown(t *testing.T) {
 			t.Fatalf("goroutine %d unexpectedly succeeded in cooldown", i)
 		}
 	}
+	// 10 次冷却快败不得产生新的握手观测
+	if h := st.snapshot().Histograms[histUDPAssocDialSeconds]; h.Count != 1 {
+		t.Fatalf("cooldown fast-fails must not hit histogram, count=%d want 1", h.Count)
+	}
 
 	// 代理恢复 + 冷却结束：下一次请求正常建连
 	alive := startMockSocks5UDP(t)
@@ -483,6 +493,10 @@ func TestAssocCooldown(t *testing.T) {
 	alive.mu.Unlock()
 	if count != 1 {
 		t.Fatalf("expected one control connection after recovery, got %d", count)
+	}
+	// 恢复后第二次真实握手：累计 2 次观测
+	if h := st.snapshot().Histograms[histUDPAssocDialSeconds]; h.Count != 2 {
+		t.Fatalf("after recovery histogram count=%d want 2", h.Count)
 	}
 }
 

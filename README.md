@@ -42,6 +42,14 @@ domain-socks -socks <proxy_ip:port> -dns <dns_listen> -listen <redirect_listen>
 - `-udplisten`: Transparent UDP REDIRECT listen address for SOCKS5 UDP ASSOCIATE relay (IPv4 only; default: disabled; e.g. `0.0.0.0:12346`). Requires a matching `nat ... -p udp -j REDIRECT` rule — set `ENABLE_UDP=1` in the init script to install it
 - `-tproxy`: TCP TPROXY dual-stack listen address (default: disabled; e.g. `:12345`). Mutually exclusive with `-listen`; enables interception of native IPv6 traffic. Requires `mangle ... -j TPROXY` rules plus `fwmark` policy routing (see below)
 - `-udp-tproxy`: UDP TPROXY dual-stack listen address (default: disabled; e.g. `:12346`). Mutually exclusive with `-udplisten`; use together with `-tproxy` and `ENABLE_UDP=1` for IPv6 UDP relay
+- `-stats-addr`: Read-only runtime metrics endpoint (default: `127.0.0.1:18080`). `GET /` returns a human-readable snapshot, `GET /json` machine-readable JSON — TCP proxy/direct/failure counts, UDP packets in/out, ASSOCIATE establish/teardown/cooldown counts, active UDP clients/flows gauges, uptime and goroutine count. Loopback-only by default; set empty to disable, or `0.0.0.0:18080` to expose to the LAN (no control surface, counters only)
+
+Quick check on the router:
+
+```bash
+curl -s http://127.0.0.1:18080/ | grep -E 'socks_fail|assoc_|forward_fail'
+# sustained udp_assoc_teardown + socks_fail/forward_fail growth => upstream proxy unhealthy
+```
 
 ## Firewall Rules
 

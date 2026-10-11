@@ -58,6 +58,7 @@ type udpGateway struct {
 	resolver ghdns.Resolver
 	proxy    *udpProxyRelay
 	direct   *udpDirectRelay
+	stats    *stats
 
 	mu             sync.Mutex
 	clients        map[string]*udpClient
@@ -75,6 +76,12 @@ func newUDPGateway(resolver ghdns.Resolver, proxyAddr, user, pass string) *udpGa
 	g.proxy = newUDPProxyRelay(proxyAddr, user, pass, g.onProxyPacket)
 	g.direct = newUDPDirectRelay(g.onDirectPacket)
 	return g
+}
+
+// setStats 绑定运行时指标（nil 安全，不绑定时所有埋点为空操作）
+func (g *udpGateway) setStats(s *stats) {
+	g.stats = s
+	g.proxy.stats = s
 }
 
 // run 启动空闲会话回收。返回前阻塞直到 ctx 取消。
@@ -135,6 +142,7 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 		return
 	}
 	dstIP = canonicalIP(dstIP)
+	g.stats.inc(statUDPIn)
 	g.mu.Lock()
 	if g.closed {
 		g.mu.Unlock()
@@ -198,12 +206,17 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 
 	var err error
 	if viaProxy {
+		g.stats.inc(statUDPProxyIn)
 		err = g.proxy.send(target, dstPort, data)
 	} else {
+		g.stats.inc(statUDPDirectIn)
 		err = g.direct.send(dstIP, dstPort, data)
 	}
-	if err != nil && g.shouldLogFwdFail() {
-		log.Printf("udp forward fail %s -> %s: %v", c.addr, flowKey, err)
+	if err != nil {
+		g.stats.inc(statUDPFwdFail)
+		if g.shouldLogFwdFail() {
+			log.Printf("udp forward fail %s -> %s: %v", c.addr, flowKey, err)
+		}
 	}
 }
 
@@ -239,6 +252,8 @@ func (g *udpGateway) deliverBack(flowKey string, data []byte) {
 	f, ok := g.flows[flowKey]
 	if !ok {
 		g.mu.Unlock()
+		// flow 已被空闲回收，或 SOCKS5 回包头与任何在途目标都不匹配
+		g.stats.inc(statUDPReplyMiss)
 		return
 	}
 	f.lastSeen = time.Now()
@@ -254,7 +269,18 @@ func (g *udpGateway) deliverBack(flowKey string, data []byte) {
 	}
 	if err := reply(data); err != nil {
 		log.Printf("udp reply fail %s <- %s: %v", addr, flowKey, err)
+		return
 	}
+	g.stats.inc(statUDPReplies)
+}
+
+// activeCounts 返回瞬时活跃 client/flow 数（统计 gauge 用）
+func (g *udpGateway) activeCounts() (clients, flows int64) {
+	g.mu.Lock()
+	clients = int64(len(g.clients))
+	flows = int64(len(g.flows))
+	g.mu.Unlock()
+	return
 }
 
 func (g *udpGateway) Close() {
@@ -296,6 +322,18 @@ type udpProxyRelay struct {
 	cooldownUntil time.Time
 	lastDialErr   error
 	closed        bool
+	stats         *stats
+}
+
+// assocIsUp 供统计 gauge 查询 association 在线状态
+func (r *udpProxyRelay) assocIsUp() int64 {
+	r.mu.Lock()
+	up := r.relay != nil
+	r.mu.Unlock()
+	if up {
+		return 1
+	}
+	return 0
 }
 
 func newUDPProxyRelay(proxyAddr, user, pass string, inbound func(string, int, []byte)) *udpProxyRelay {
@@ -340,6 +378,7 @@ func (r *udpProxyRelay) ensureAssoc() error {
 		// 建连失败冷却中：快速失败，不让每个入站包都堆积一个 10s 窗口
 		if err := r.lastDialErr; time.Now().Before(r.cooldownUntil) && err != nil {
 			r.mu.Unlock()
+			r.stats.inc(statAssocCool)
 			return err
 		}
 		if r.creating == nil {
@@ -426,6 +465,7 @@ func (r *udpProxyRelay) buildAssoc() error {
 	r.mu.Unlock()
 
 	log.Printf("udp associate established: relay=%s", relayAddr.String())
+	r.stats.inc(statAssocUp)
 
 	go r.watchControl(control, relayConn)
 	go r.readRelay(relayConn, relayAddr, control)
@@ -483,6 +523,7 @@ func (r *udpProxyRelay) readRelay(relayConn *net.UDPConn, expected *net.UDPAddr,
 		}
 		host, port, payload, err := unpackSocks5UDP(buf[:n])
 		if err != nil {
+			r.stats.inc(statAssocBadPkt)
 			log.Printf("udp relay unpack from %s: %v", src, err)
 			continue
 		}
@@ -501,6 +542,9 @@ func (r *udpProxyRelay) teardown(control net.Conn, relayConn *net.UDPConn) {
 		return
 	}
 	r.mu.Unlock()
+	// 仅当前代 association 的真实拆除才计数（close() 走自己的路径，
+	// 其控制/relay 已先置空，不会误计）
+	r.stats.inc(statAssocDown)
 	_ = relayConn.Close()
 	_ = control.Close()
 }

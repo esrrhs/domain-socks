@@ -35,6 +35,7 @@ func main() {
 	udpListen := flag.String("udplisten", "", "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
 	tproxyListen := flag.String("tproxy", "", "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
 	udpTProxy := flag.String("udp-tproxy", "", "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
+	statsAddr := flag.String("stats-addr", "127.0.0.1:18080", "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
 	flag.Parse()
 
 	listenExplicitlySet := false
@@ -104,7 +105,16 @@ func main() {
 
 	// 5. UDP 透明转发（默认关闭）：REDIRECT（v4）或 TPROXY（双栈），
 	// 需配合对应防火墙规则显式启用
+	appStats := newStats()
 	gw := newUDPGateway(r, *socks, *socksUser, *socksPass)
+	gw.setStats(appStats)
+	appStats.registerGauges(map[string]func() int64{
+		"udp_active_clients": func() int64 { n, _ := gw.activeCounts(); return n },
+		"udp_active_flows":   func() int64 { _, n := gw.activeCounts(); return n },
+		"udp_assoc_up":       gw.proxy.assocIsUp,
+	})
+	statsSrv := startStatsServer(*statsAddr, appStats)
+
 	gwCtx, gwCancel := context.WithCancel(context.Background())
 	defer gwCancel()
 	go gw.run(gwCtx)
@@ -154,7 +164,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf)
+				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf, appStats)
 			}()
 		}
 	}()
@@ -167,6 +177,9 @@ func main() {
 	}
 	gwCancel()
 	gw.Close()
+	if statsSrv != nil {
+		_ = statsSrv.Close()
+	}
 	_ = ln.Close()
 	_ = dnsServer.Stop()
 
@@ -217,10 +230,12 @@ func localDst(c net.Conn) (net.IP, int, error) {
 	return canonicalIP(ta.IP), ta.Port, nil
 }
 
-func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver) {
+func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver, st *stats) {
 	defer c.Close()
+	st.inc(statTCPAccepted)
 	dstIP, dstPort, err := dstOf(c)
 	if err != nil {
+		st.inc(statTCPDstFail)
 		log.Printf("resolve original dst: %v", err)
 		return
 	}
@@ -244,6 +259,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 
 	// 针对网络连通性探测 (Captive portal probe) 快速响应 204
 	if dstPort == 80 && captiveProbe(prefix, domain) {
+		st.inc(statTCPCaptive)
 		_, _ = c.Write([]byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
@@ -273,18 +289,22 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 		how = "socks"
 		up, err = socksConnect(proxy, domain, dstIP, dstPort, socksUser, socksPass)
 		if err != nil {
+			st.inc(statTCPSocksFail)
 			log.Printf("socks fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
 			return
 		}
+		st.inc(statTCPProxy)
 	} else {
 		// 直连直达
 		targetDesc = dstIP.String()
 		how = "direct"
 		up, err = net.DialTimeout("tcp", net.JoinHostPort(targetDesc, fmt.Sprintf("%d", dstPort)), 8*time.Second)
 		if err != nil {
+			st.inc(statTCPDirectFail)
 			log.Printf("direct fail %s -> %s:%d: %v", c.RemoteAddr(), targetDesc, dstPort, err)
 			return
 		}
+		st.inc(statTCPDirect)
 	}
 	defer up.Close()
 

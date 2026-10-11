@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -440,6 +441,106 @@ func (s *stats) renderTop() string {
 	return b.String()
 }
 
+// Prometheus 文本 exposition（0.0.4，零依赖纯文本）。计数器统一加
+// _total 后缀，gauge 不加，直方图输出 _bucket(累计)/_sum/_count。
+// 族按名排序，多次抓取字节级确定，方便 Prometheus/Alertmanager 抓取。
+const promPrefix = "domain_socks_"
+
+// metricHelp 为 /metrics 提供人类可读说明；新增计数器时在此补一行，
+// 缺失的键回退到通用说明，不影响输出合法性。
+var metricHelp = map[string]string{
+	statTCPAccepted:          "Total intercepted inbound TCP connections.",
+	statTCPProxy:             "TCP connections successfully relayed via upstream SOCKS5.",
+	statTCPDirect:            "TCP connections successfully dialed directly.",
+	statTCPCaptive:           "Captive-portal probes answered with synthetic HTTP 204.",
+	statTCPDstFail:           "TCP connections whose original destination could not be recovered.",
+	statTCPSocksFail:         "TCP SOCKS5 dial/negotiate/CONNECT failures.",
+	statTCPDirectFail:        "TCP direct dial failures.",
+	statUDPIn:                "Total inbound UDP datagrams received from LAN clients.",
+	statUDPProxyIn:           "Inbound UDP datagrams classified to relay.",
+	statUDPDirectIn:          "Inbound UDP datagrams classified direct.",
+	statUDPReplies:           "UDP replies successfully delivered back to LAN clients.",
+	statUDPReplyMiss:         "UDP replies with no matching client flow (expired/stale).",
+	statUDPFwdFail:           "UDP forward failures, including cooldown fast-fails.",
+	statAssocUp:              "Successful UDP ASSOCIATE establishments.",
+	statAssocDown:            "UDP ASSOCIATE teardowns (upstream close/errors).",
+	statAssocCool:            "UDP sends fast-failed by the dial cooldown.",
+	statAssocBadPkt:          "Malformed UDP relay packets from the upstream.",
+	statDNSQueries:           "Total DNS queries received by the local resolver.",
+	statDNSAAAA:              "DNS AAAA queries received.",
+	statDNSAAAAFiltered:      "Proxy-domain AAAA queries answered with empty NOERROR.",
+	statDNSFakeIP:            "DNS responses containing Fake-IP A records.",
+	statDNSErrors:            "DNS queries that failed at the upstream resolver.",
+	statTCPProxyBytesUp:      "Bytes sent LAN->remote over SOCKS5-relayed TCP.",
+	statTCPProxyBytesDown:    "Bytes sent remote->LAN over SOCKS5-relayed TCP.",
+	statTCPDirectBytesUp:     "Bytes sent LAN->remote over direct TCP.",
+	statTCPDirectBytesDown:   "Bytes sent remote->LAN over direct TCP.",
+	statUDPBytesIn:           "UDP payload bytes received from LAN clients.",
+	statUDPBytesOut:          "UDP payload bytes delivered back to LAN clients.",
+	histTCPProxyDialSeconds:  "Time spent in SOCKS5 dial+negotiate+CONNECT (incl. failures).",
+	histTCPDirectDialSeconds: "Time spent in direct TCP dial (incl. failures).",
+}
+
+func promHelp(key string) string {
+	if h, ok := metricHelp[key]; ok {
+		return h
+	}
+	return "domain-socks metric " + key + "."
+}
+
+func promWriteHeader(b *strings.Builder, family, typ, help string) {
+	fmt.Fprintf(b, "# HELP %s %s\n", family, help)
+	fmt.Fprintf(b, "# TYPE %s %s\n", family, typ)
+}
+
+func promFormatFloat(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}
+
+// renderPrometheus 输出 /metrics。nil 接收者只报 up=0，便于探针类调用方。
+func (s *stats) renderPrometheus() string {
+	var b strings.Builder
+	promWriteHeader(&b, promPrefix+"up", "gauge",
+		"1 if the domain-socks process is serving metrics, 0 otherwise.")
+	if s == nil {
+		b.WriteString(promPrefix + "up 0\n")
+		return b.String()
+	}
+	b.WriteString(promPrefix + "up 1\n")
+
+	snap := s.snapshot()
+	for _, k := range sortedKeys(snap.Counters) {
+		family := promPrefix + k + "_total"
+		promWriteHeader(&b, family, "counter", promHelp(k))
+		fmt.Fprintf(&b, "%s %d\n", family, snap.Counters[k])
+	}
+
+	// 动态 gauge + 两个 runtime gauge
+	for _, k := range sortedKeys(snap.Gauges) {
+		family := promPrefix + k
+		promWriteHeader(&b, family, "gauge", "domain-socks instantaneous gauge "+k+".")
+		fmt.Fprintf(&b, "%s %d\n", family, snap.Gauges[k])
+	}
+	promWriteHeader(&b, promPrefix+"uptime_seconds", "gauge", "Process uptime in seconds.")
+	fmt.Fprintf(&b, "%suptime_seconds %d\n", promPrefix, snap.UptimeSeconds)
+	promWriteHeader(&b, promPrefix+"goroutines", "gauge", "Current number of goroutines.")
+	fmt.Fprintf(&b, "%sgoroutines %d\n", promPrefix, snap.Goroutines)
+
+	for _, k := range sortedKeys(snap.Histograms) {
+		family := promPrefix + k
+		h := snap.Histograms[k]
+		promWriteHeader(&b, family, "histogram", promHelp(k))
+		for i, le := range h.BucketsLE {
+			fmt.Fprintf(&b, "%s_bucket{le=\"%s\"} %d\n",
+				family, promFormatFloat(le), h.CumulativeCounts[i])
+		}
+		fmt.Fprintf(&b, "%s_bucket{le=\"+Inf\"} %d\n", family, h.Count)
+		fmt.Fprintf(&b, "%s_sum %s\n", family, promFormatFloat(h.SumSeconds))
+		fmt.Fprintf(&b, "%s_count %d\n", family, h.Count)
+	}
+	return b.String()
+}
+
 // registerGauges 注册瞬时值采集函数（如活跃 flow 数、association 在线状态）
 func (s *stats) registerGauges(m map[string]func() int64) {
 	if s == nil {
@@ -603,6 +704,12 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprint(w, s.renderTop())
 	})
+	// /metrics：Prometheus 文本 exposition（0.0.4）
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprint(w, s.renderPrometheus())
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -614,6 +721,6 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 			log.Printf("stats server: %v", err)
 		}
 	}()
-	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns /top)", ln.Addr())
+	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns /top /metrics)", ln.Addr())
 	return srv
 }

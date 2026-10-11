@@ -840,3 +840,159 @@ func TestTopHTTPEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// parsePromLines 极简解析 /metrics：返回 sample[name+labels]=value，
+// typ[name]=类型，help 存在性单独检查。
+func parsePromLines(t *testing.T, body string) (map[string]string, map[string]string, int) {
+	t.Helper()
+	samples := map[string]string{}
+	types := map[string]string{}
+	helpCount := 0
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "# TYPE "):
+			fields := strings.Fields(line)
+			if len(fields) != 4 {
+				t.Fatalf("bad TYPE line: %q", line)
+			}
+			types[fields[2]] = fields[3]
+		case strings.HasPrefix(line, "# HELP "):
+			helpCount++
+		case strings.HasPrefix(line, "#"):
+			t.Fatalf("unexpected comment: %q", line)
+		default:
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				t.Fatalf("bad sample line: %q", line)
+			}
+			samples[fields[0]] = fields[1]
+		}
+	}
+	return samples, types, helpCount
+}
+
+func TestPrometheusExposition(t *testing.T) {
+	s := newStats()
+	s.inc(statTCPAccepted)
+	s.inc(statTCPAccepted)
+	s.inc(statTCPProxyBytesDown) // 值为 1 的字节计数器
+	s.observe(histTCPProxyDialSeconds, 5*time.Millisecond)
+	s.observe(histTCPProxyDialSeconds, 3*time.Second)
+
+	body := s.renderPrometheus()
+	samples, types, helpCount := parsePromLines(t, body)
+
+	// 每个 TYPE 都有配套 HELP
+	if helpCount != len(types) {
+		t.Fatalf("HELP lines=%d != TYPE families=%d", helpCount, len(types))
+	}
+	if v := samples["domain_socks_up"]; v != "1" || types["domain_socks_up"] != "gauge" {
+		t.Fatalf("up gauge: val=%q type=%q", v, types["domain_socks_up"])
+	}
+	if v := samples["domain_socks_tcp_accepted_total"]; v != "2" ||
+		types["domain_socks_tcp_accepted_total"] != "counter" {
+		t.Fatalf("accepted counter: val=%q type=%q", v, types["domain_socks_tcp_accepted_total"])
+	}
+	if v := samples["domain_socks_tcp_proxy_bytes_down_total"]; v != "1" {
+		t.Fatalf("bytes counter=%q", v)
+	}
+	// 计数器不得出现不带 _total 的裸名
+	if _, ok := samples["domain_socks_tcp_accepted"]; ok {
+		t.Fatal("counters must use _total suffix")
+	}
+	for _, g := range []string{"domain_socks_uptime_seconds", "domain_socks_goroutines", "domain_socks_tcp_active"} {
+		if types[g] != "gauge" {
+			t.Fatalf("%s type=%q want gauge", g, types[g])
+		}
+		if _, ok := samples[g]; !ok {
+			t.Fatalf("missing gauge sample %s", g)
+		}
+	}
+
+	// 直方图族：13 个有限 le 桶 + +Inf + sum + count
+	fam := "domain_socks_tcp_proxy_dial_seconds"
+	if types[fam] != "histogram" {
+		t.Fatalf("histogram family type=%q", types[fam])
+	}
+	var bucketLines int
+	var infCount string
+	for name, v := range samples {
+		if strings.HasPrefix(name, fam+"_bucket{le=") {
+			bucketLines++
+			if strings.Contains(name, `le="+Inf"`) {
+				infCount = v
+			}
+		}
+	}
+	if bucketLines != len(dialBuckets)+1 {
+		t.Fatalf("bucket lines=%d want %d", bucketLines, len(dialBuckets)+1)
+	}
+	if infCount != "2" {
+		t.Fatalf("+Inf bucket=%q want 2", infCount)
+	}
+	if samples[fam+"_count"] != "2" {
+		t.Fatalf("hist count=%q want 2", samples[fam+"_count"])
+	}
+	// 5ms 与 3s 的桶累计：le=0.005 应为 1，le=5（含两样本）应为 2
+	wantLe := map[string]string{
+		fam + `_bucket{le="0.005"}`: "1",
+		fam + `_bucket{le="5"}`:     "2",
+	}
+	for k, want := range wantLe {
+		if samples[k] != want {
+			t.Fatalf("%s=%q want %s", k, samples[k], want)
+		}
+	}
+	if sum := samples[fam+"_sum"]; sum != "3.005" {
+		t.Fatalf("hist sum=%q want 3.005", sum)
+	}
+
+	// 除 le 标签外不得出现 Inf/NaN 值
+	for name, v := range samples {
+		if strings.Contains(name, "_bucket{") {
+			continue
+		}
+		if v == "+Inf" || v == "-Inf" || v == "NaN" {
+			t.Fatalf("illegal float value for %s: %s", name, v)
+		}
+	}
+
+	// 输出确定性：连续两次渲染字节一致
+	if body != s.renderPrometheus() {
+		t.Fatal("prometheus render is not deterministic")
+	}
+
+	// nil stats 安全：只报 up=0
+	var nilS *stats
+	nilBody := nilS.renderPrometheus()
+	nSamples, _, _ := parsePromLines(t, nilBody)
+	if nSamples["domain_socks_up"] != "0" || len(nSamples) != 1 {
+		t.Fatalf("nil render=%q", nilBody)
+	}
+}
+
+func TestMetricsHTTPEndpoint(t *testing.T) {
+	s := newStats()
+	srv := startStatsServer("127.0.0.1:0", s, nil)
+	if srv == nil {
+		t.Fatal("stats server failed")
+	}
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
+	if resp.StatusCode != 200 || !strings.HasPrefix(ct, "text/plain; version=0.0.4") {
+		t.Fatalf("/metrics: status=%d content-type=%q", resp.StatusCode, ct)
+	}
+	if !strings.Contains(string(body), "# TYPE domain_socks_tcp_accepted_total counter") {
+		t.Fatalf("/metrics missing TYPE header:\n%s", body)
+	}
+}

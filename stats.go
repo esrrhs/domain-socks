@@ -33,6 +33,12 @@ const (
 	statAssocDown    = "udp_assoc_teardown"    // ASSOCIATE 被拆除次数（断连/关闭）
 	statAssocCool    = "udp_assoc_cooldown"    // 命中建连冷却快速失败次数
 	statAssocBadPkt  = "udp_assoc_bad_packet"  // relay 回包解析失败次数
+
+	statDNSQueries      = "dns_queries"        // 到达本地解析器的查询总数
+	statDNSAAAA         = "dns_queries_aaaa"   // 其中 AAAA 查询数
+	statDNSAAAAFiltered = "dns_aaaa_filtered"  // 代理域名 AAAA 被空 NOERROR 拦截数
+	statDNSFakeIP       = "dns_fakeip_answers" // 应答含 Fake-IP A 记录的响应数
+	statDNSErrors       = "dns_errors"         // 上游解析失败的查询数
 )
 
 // stats 持有进程级数据面计数器。所有 inc 方法对 nil 接收者安全，
@@ -41,6 +47,8 @@ type stats struct {
 	start time.Time
 
 	counters map[string]*atomic.Int64
+	// tcpActive 是当前处于转发/嗅探阶段的透明 TCP 连接数
+	tcpActive atomic.Int64
 
 	mu     sync.Mutex
 	gauges map[string]func() int64
@@ -53,6 +61,8 @@ func newStats() *stats {
 		statUDPIn, statUDPProxyIn, statUDPDirectIn,
 		statUDPReplies, statUDPReplyMiss, statUDPFwdFail,
 		statAssocUp, statAssocDown, statAssocCool, statAssocBadPkt,
+		statDNSQueries, statDNSAAAA, statDNSAAAAFiltered,
+		statDNSFakeIP, statDNSErrors,
 	}
 	s := &stats{
 		start:    time.Now(),
@@ -62,7 +72,21 @@ func newStats() *stats {
 	for _, k := range keys {
 		s.counters[k] = new(atomic.Int64)
 	}
+	// 内部 gauge 直接注册
+	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
+}
+
+func (s *stats) tcpConnOpened() {
+	if s != nil {
+		s.tcpActive.Add(1)
+	}
+}
+
+func (s *stats) tcpConnClosed() {
+	if s != nil {
+		s.tcpActive.Add(-1)
+	}
 }
 
 func (s *stats) inc(key string) {

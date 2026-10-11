@@ -75,10 +75,13 @@ func main() {
 		log.Fatalf("init resolver failed: %v", err)
 	}
 
-	// 2. 包装 Resolver：过滤代理域名的 AAAA，防止客户端走真实 IPv6 绕过透明代理
-	var r ghdns.Resolver = resolver
-	if *disableAAAA {
-		r = &aaaaFilter{Resolver: r}
+	// 2. 包装 Resolver：过滤代理域名的 AAAA，防止客户端走真实 IPv6 绕过透明
+	// 代理。始终包装一层以便统计 DNS 平面指标；过滤与否由 enabled 控制。
+	appStats := newStats()
+	var r ghdns.Resolver = &aaaaFilter{
+		Resolver: resolver,
+		st:       appStats,
+		enabled:  *disableAAAA,
 	}
 
 	// 3. 启动 DNS 服务端（双栈监听，使 v4/v6 的 nat REDIRECT 都能送达）
@@ -105,7 +108,6 @@ func main() {
 
 	// 5. UDP 透明转发（默认关闭）：REDIRECT（v4）或 TPROXY（双栈），
 	// 需配合对应防火墙规则显式启用
-	appStats := newStats()
 	gw := newUDPGateway(r, *socks, *socksUser, *socksPass)
 	gw.setStats(appStats)
 	appStats.registerGauges(map[string]func() int64{
@@ -196,24 +198,46 @@ func main() {
 	_ = resolver.Close()
 }
 
-// aaaaFilter 包装 gohome Resolver：对判定走代理的域名，AAAA 查询直接返回空
-// NOERROR 响应，迫使客户端回退到 A 记录（Fake-IP），避免客户端拿到真实 IPv6
-// 后绕过仅劫持 TCP/IPv4 的透明代理造成流量泄漏。直连域名的 AAAA 正常透传，
-// 保留国内双栈访问能力。ShouldProxy 出错时 gohome 默认按代理处理，同样过滤。
+// aaaaFilter 包装 gohome Resolver，承担两件事：
+//  1. enabled 时对判定走代理的域名，AAAA 查询直接返回空 NOERROR，迫使客户端
+//     回退到 A 记录（Fake-IP），避免拿到真实 IPv6 后绕过透明代理泄漏；
+//     直连域名的 AAAA 正常透传，保留国内双栈。ShouldProxy 出错按代理处理。
+//  2. DNS 平面指标：查询总数、AAAA 数、拦截数、Fake-IP 应答数、上游错误数。
 type aaaaFilter struct {
 	ghdns.Resolver
+	st      *stats
+	enabled bool
 }
 
 func (f *aaaaFilter) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	f.st.inc(statDNSQueries)
 	if req != nil && len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA {
+		f.st.inc(statDNSAAAA)
 		name := strings.TrimSuffix(req.Question[0].Name, ".")
-		if proxy, _ := f.Resolver.ShouldProxy(name); proxy {
-			resp := new(dns.Msg)
-			resp.SetReply(req)
-			return resp, nil
+		if f.enabled {
+			if proxy, _ := f.Resolver.ShouldProxy(name); proxy {
+				f.st.inc(statDNSAAAAFiltered)
+				resp := new(dns.Msg)
+				resp.SetReply(req)
+				return resp, nil
+			}
 		}
 	}
-	return f.Resolver.Exchange(ctx, req)
+	resp, err := f.Resolver.Exchange(ctx, req)
+	if err != nil {
+		f.st.inc(statDNSErrors)
+		return nil, err
+	}
+	// Fake-IP 是分流劫持实际生效的证据：任一 A 记录命中 Fake-IP 段即计一次
+	if resp != nil {
+		for _, rr := range resp.Answer {
+			if a, ok := rr.(*dns.A); ok && f.Resolver.IsFakeIP(a.A) {
+				f.st.inc(statDNSFakeIP)
+				break
+			}
+		}
+	}
+	return resp, nil
 }
 
 // dstResolver 从已截获的连接上取原始目标：REDIRECT 用 SO_ORIGINAL_DST
@@ -233,6 +257,8 @@ func localDst(c net.Conn) (net.IP, int, error) {
 func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser string, socksPass string, dstOf dstResolver, st *stats) {
 	defer c.Close()
 	st.inc(statTCPAccepted)
+	st.tcpConnOpened()
+	defer st.tcpConnClosed()
 	dstIP, dstPort, err := dstOf(c)
 	if err != nil {
 		st.inc(statTCPDstFail)

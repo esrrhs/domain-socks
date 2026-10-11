@@ -213,26 +213,47 @@ func TestSocks5AuthServer(t *testing.T) {
 	conn.Close()
 }
 
-// stubExchangeResolver 只实现 AAAA 过滤测试关心的两个方法，
+// stubExchangeResolver 只实现 DNS 中间件测试关心的方法，
 // 其余方法通过内嵌 nil 接口在被误调用时直接 panic，暴露测试问题。
 type stubExchangeResolver struct {
 	ghdns.Resolver
 	proxyDomains map[string]bool
 	upstreamHits int
+	// isFake 非 nil 时为 A 查询返回 Fake-IP 段应答
+	isFake func(net.IP) bool
+	// fail 非 nil 时 Exchange 直接返回该错误
+	fail error
 }
 
 func (s *stubExchangeResolver) ShouldProxy(target string) (bool, error) {
 	return s.proxyDomains[target], nil
 }
 
+func (s *stubExchangeResolver) IsFakeIP(ip net.IP) bool {
+	return s.isFake != nil && s.isFake(ip)
+}
+
 func (s *stubExchangeResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	s.upstreamHits++
+	if s.fail != nil {
+		return nil, s.fail
+	}
 	resp := new(dns.Msg)
 	resp.SetReply(req)
-	if len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA {
+	if len(req.Question) == 0 {
+		return resp, nil
+	}
+	q := req.Question[0]
+	switch q.Qtype {
+	case dns.TypeAAAA:
 		resp.Answer = append(resp.Answer, &dns.AAAA{
-			Hdr:  dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
 			AAAA: net.ParseIP("2001:db8::1"),
+		})
+	case dns.TypeA:
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.IPv4(198, 18, 0, 5),
 		})
 	}
 	return resp, nil
@@ -240,7 +261,7 @@ func (s *stubExchangeResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns
 
 func TestAAAAFilter(t *testing.T) {
 	stub := &stubExchangeResolver{proxyDomains: map[string]bool{"www.google.com": true}}
-	f := &aaaaFilter{Resolver: stub}
+	f := &aaaaFilter{Resolver: stub, enabled: true}
 
 	// 代理域名 AAAA：返回空 NOERROR，且不得透传到上游（防 IPv6 泄漏）
 	req := new(dns.Msg)
@@ -275,6 +296,92 @@ func TestAAAAFilter(t *testing.T) {
 	}
 	if stub.upstreamHits != 2 {
 		t.Fatalf("A query must pass through, upstream hits=%d", stub.upstreamHits)
+	}
+}
+
+// TestDNSMetrics 验证 DNS 中间件在各路径上的计数：
+// 代理 AAAA 拦截、AAAA 透传、Fake-IP A 应答、上游错误，以及 disabled 开关。
+func TestDNSMetrics(t *testing.T) {
+	stub := &stubExchangeResolver{
+		proxyDomains: map[string]bool{"www.google.com": true},
+		isFake: func(ip net.IP) bool {
+			v4 := ip.To4()
+			return v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19)
+		},
+	}
+	st := newStats()
+	f := &aaaaFilter{Resolver: stub, st: st, enabled: true}
+
+	aaaaProxy := new(dns.Msg)
+	aaaaProxy.SetQuestion("www.google.com.", dns.TypeAAAA)
+	if _, err := f.Exchange(context.Background(), aaaaProxy); err != nil {
+		t.Fatal(err)
+	}
+	aaaaDirect := new(dns.Msg)
+	aaaaDirect.SetQuestion("www.baidu.com.", dns.TypeAAAA)
+	if _, err := f.Exchange(context.Background(), aaaaDirect); err != nil {
+		t.Fatal(err)
+	}
+	aReq := new(dns.Msg)
+	aReq.SetQuestion("www.google.com.", dns.TypeA)
+	if _, err := f.Exchange(context.Background(), aReq); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := st.snapshot().Counters
+	if snap[statDNSQueries] != 3 {
+		t.Fatalf("dns_queries=%d want 3", snap[statDNSQueries])
+	}
+	if snap[statDNSAAAA] != 2 {
+		t.Fatalf("dns_queries_aaaa=%d want 2", snap[statDNSAAAA])
+	}
+	if snap[statDNSAAAAFiltered] != 1 {
+		t.Fatalf("dns_aaaa_filtered=%d want 1", snap[statDNSAAAAFiltered])
+	}
+	if snap[statDNSFakeIP] != 1 {
+		t.Fatalf("dns_fakeip_answers=%d want 1", snap[statDNSFakeIP])
+	}
+	if snap[statDNSErrors] != 0 {
+		t.Fatalf("dns_errors=%d want 0", snap[statDNSErrors])
+	}
+
+	// 上游错误必须计数且错误透传
+	stub.fail = fmt.Errorf("upstream boom")
+	if _, err := f.Exchange(context.Background(), aReq); err == nil {
+		t.Fatal("expected upstream error to propagate")
+	}
+	if got := st.snapshot().Counters[statDNSErrors]; got != 1 {
+		t.Fatalf("dns_errors=%d want 1", got)
+	}
+	stub.fail = nil
+
+	// enabled=false：代理域名 AAAA 也透传，filtered 不再增长
+	f.enabled = false
+	if _, err := f.Exchange(context.Background(), aaaaProxy); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.snapshot().Counters[statDNSAAAAFiltered]; got != 1 {
+		t.Fatalf("filtered must stay 1 when disabled, got %d", got)
+	}
+	if stub.upstreamHits != 4 { // aaaaDirect + aReq + failed aReq + disabled aaaaProxy
+		t.Fatalf("upstreamHits=%d want 4", stub.upstreamHits)
+	}
+}
+
+// TestTCPActiveGauge 验证活跃连接 gauge 的开/闭配对
+func TestTCPActiveGauge(t *testing.T) {
+	st := newStats()
+	if got := st.snapshot().Gauges["tcp_active"]; got != 0 {
+		t.Fatalf("initial tcp_active=%d want 0", got)
+	}
+	st.tcpConnOpened()
+	st.tcpConnOpened()
+	if got := st.snapshot().Gauges["tcp_active"]; got != 2 {
+		t.Fatalf("tcp_active=%d want 2", got)
+	}
+	st.tcpConnClosed()
+	if got := st.snapshot().Gauges["tcp_active"]; got != 1 {
+		t.Fatalf("tcp_active=%d want 1", got)
 	}
 }
 

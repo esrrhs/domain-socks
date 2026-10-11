@@ -530,6 +530,49 @@ func promFormatFloat(v float64) string {
 	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
+// promEscapeLabel 按 Prometheus exposition 规范转义 label 值
+// （反斜杠/双引号/换行）。域名与 IP 通常是干净 ASCII，仍做防御。
+func promEscapeLabel(v string) string {
+	if !strings.ContainsAny(v, "\\\"\n") {
+		return v
+	}
+	var b strings.Builder
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// promWriteTopSection 把 /top 排行榜当前前 N 行导出为两个 counter 族：
+// 字节（direction=up/down）与连接数（via=proxy/direct）。label 基数有
+// 硬上限（每维 4*aggTopN 个样本）；无数据时仍输出族头，保持结构稳定。
+// 成员随排名变化，值是进程启动以来的累计量（进程重启即计数器重置）。
+func promWriteTopSection(b *strings.Builder, dimension string, rows []aggRow) {
+	n := strconv.Itoa(aggTopN)
+	bytesFam := promPrefix + "top_" + dimension + "_bytes_total"
+	connsFam := promPrefix + "top_" + dimension + "_connections_total"
+	promWriteHeader(b, bytesFam, "counter",
+		"Cumulative bytes for the current top "+n+" "+dimension+"s by total bytes since process start; membership may change and overflow folds into __other__.")
+	promWriteHeader(b, connsFam, "counter",
+		"Cumulative connections for the current top "+n+" "+dimension+"s by total bytes since process start, split by route.")
+	for _, r := range rows {
+		name := promEscapeLabel(r.key)
+		fmt.Fprintf(b, "%s{name=\"%s\",direction=\"up\"} %d\n", bytesFam, name, r.up)
+		fmt.Fprintf(b, "%s{name=\"%s\",direction=\"down\"} %d\n", bytesFam, name, r.down)
+		fmt.Fprintf(b, "%s{name=\"%s\",via=\"proxy\"} %d\n", connsFam, name, r.proxy)
+		fmt.Fprintf(b, "%s{name=\"%s\",via=\"direct\"} %d\n", connsFam, name, r.direct)
+	}
+}
+
 // renderPrometheus 输出 /metrics。nil 接收者只报 up=0，便于探针类调用方。
 func (s *stats) renderPrometheus() string {
 	var b strings.Builder
@@ -571,6 +614,10 @@ func (s *stats) renderPrometheus() string {
 		fmt.Fprintf(&b, "%s_sum %s\n", family, promFormatFloat(h.SumSeconds))
 		fmt.Fprintf(&b, "%s_count %d\n", family, h.Count)
 	}
+
+	// /top 排行榜：只导出当前 top-N，label 基数有硬上限
+	promWriteTopSection(&b, "domain", s.domains.top(aggTopN))
+	promWriteTopSection(&b, "client", s.clients.top(aggTopN))
 	return b.String()
 }
 

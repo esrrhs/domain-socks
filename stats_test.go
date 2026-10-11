@@ -1047,3 +1047,63 @@ func TestMetricsHTTPEndpoint(t *testing.T) {
 		t.Fatalf("/metrics missing TYPE header:\n%s", body)
 	}
 }
+
+// TestPrometheusTopExport 验证 /top 排行榜以带 label 的 counter 导出：
+// 空表也有族头、字节/路由拆分值正确、label 转义、渲染确定、基数有界。
+func TestPrometheusTopExport(t *testing.T) {
+	s := newStats()
+	empty := s.renderPrometheus()
+	for _, hdr := range []string{
+		"# TYPE domain_socks_top_domain_bytes_total counter",
+		"# TYPE domain_socks_top_domain_connections_total counter",
+		"# TYPE domain_socks_top_client_bytes_total counter",
+		"# TYPE domain_socks_top_client_connections_total counter",
+	} {
+		if !strings.Contains(empty, hdr) {
+			t.Fatalf("empty exposition missing %q", hdr)
+		}
+	}
+	if strings.Contains(empty, "top_domain_bytes_total{") {
+		t.Fatalf("no labeled samples expected on empty table")
+	}
+
+	s.recordFlow("heavy.example", "192.168.1.9", "socks", 3000, 7000)
+	s.recordFlow("heavy.example", "192.168.1.9", "direct", 100, 200)
+	s.recordFlow("light.example", "192.168.1.10", "direct", 10, 20)
+	// 直接向表写入含特殊字符的键，验证 label 值按 \ \" \n 转义
+	s.domains.record(`bad"na\me`+"\nx", "socks", 1, 1)
+
+	body := s.renderPrometheus()
+	wantLines := []string{
+		`domain_socks_top_domain_bytes_total{name="heavy.example",direction="up"} 3100`,
+		`domain_socks_top_domain_bytes_total{name="heavy.example",direction="down"} 7200`,
+		`domain_socks_top_domain_connections_total{name="heavy.example",via="proxy"} 1`,
+		`domain_socks_top_domain_connections_total{name="heavy.example",via="direct"} 1`,
+		`domain_socks_top_client_bytes_total{name="192.168.1.9",direction="up"} 3100`,
+		`domain_socks_top_client_connections_total{name="192.168.1.10",via="direct"} 1`,
+		// 零值的 via 拆分也必须稳定输出
+		`domain_socks_top_domain_connections_total{name="light.example",via="proxy"} 0`,
+		// " \ \n -> \" \\ \n
+		`name="bad\"na\\me\nx"`,
+	}
+	for _, w := range wantLines {
+		if !strings.Contains(body, w) {
+			t.Fatalf("/metrics top export missing %q:\n%s", w, body)
+		}
+	}
+
+	// 基数硬界：域名维带 label 样本最多 4*aggTopN
+	var labeled int
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(ln, "domain_socks_top_domain_") && strings.Contains(ln, "{name=") {
+			labeled++
+		}
+	}
+	if labeled > 4*aggTopN {
+		t.Fatalf("domain labeled samples=%d exceeds bound %d", labeled, 4*aggTopN)
+	}
+
+	if body != s.renderPrometheus() {
+		t.Fatal("top export rendering is not deterministic")
+	}
+}

@@ -43,6 +43,7 @@ func main() {
 	logMaxMB := flag.Int("log-max-mb", 1, "max size in MB of one log file before it is rotated to .1")
 	logBackups := flag.Int("log-backups", 3, "number of rotated backup files to keep (.1 newest .. .N oldest)")
 	showVersion := flag.Bool("version", false, "print the embedded build version (git commit) and exit")
+	pprofEnable := flag.Bool("pprof", false, "expose Go runtime pprof diagnostics at /debug/pprof/ on the stats address (goroutine stacks, heap, CPU profile; stats addr defaults to loopback)")
 	flag.Parse()
 
 	// -version 只输出一行版本信息即退出，不初始化任何服务、不碰日志文件。
@@ -157,7 +158,7 @@ func main() {
 	readyCheck := func() error {
 		return probeSocksUpstream(*socks, *socksUser, *socksPass)
 	}
-	statsSrv := startStatsServer(*statsAddr, appStats, readyCheck)
+	statsSrv := startStatsServer(*statsAddr, appStats, readyCheck, *pprofEnable)
 
 	gwCtx, gwCancel := context.WithCancel(context.Background())
 	defer gwCancel()
@@ -193,8 +194,8 @@ func main() {
 	// 生效配置单行回显（与上面的版本行一起写进历史日志），排查"配置没生效"
 	// 类问题时不用翻 init 脚本；只回显是否有认证与用户名，绝不输出密码。
 	statsOpt := nonEmpty(*statsAddr, "off")
-	log.Printf("config: auth=%s direct-dns=%q stats=%s access-log=%v geoip=%s lists direct=%q proxy=%q",
-		describeAuth(*socksUser), *directDNS, statsOpt, *accessLog,
+	log.Printf("config: auth=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
+		describeAuth(*socksUser), *directDNS, statsOpt, *pprofEnable, *accessLog,
 		nonEmpty(*geoipFile, "off"),
 		nonEmpty(*directDomainsFile, "-"), nonEmpty(*proxyDomainsFile, "-"))
 

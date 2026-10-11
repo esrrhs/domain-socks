@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"runtime"
 	"sort"
 	"strconv"
@@ -731,7 +732,10 @@ func (rc *readinessCache) check() error {
 // 绑定失败不致命（端口冲突不应拖垮代理数据面），仅告警并返回 nil。
 // 默认 127.0.0.1:18080 只对本机可达；显式绑定 0.0.0.0/:: 会向 LAN 暴露。
 // readyCheck 非 nil 时注册 /readyz（对上游做只读协商探测）。
-func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Server {
+// pprofEnabled 时额外在 /debug/pprof/ 暴露运行时现场诊断
+// （goroutine 栈/heap/CPU profile）；默认关闭，开启后与其它端点同受
+// stats 绑定地址约束（默认仅 loopback）。
+func startStatsServer(addr string, s *stats, readyCheck func() error, pprofEnabled bool) *http.Server {
 	if addr == "" || s == nil {
 		return nil
 	}
@@ -790,6 +794,16 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprint(w, s.renderPrometheus())
 	})
+	// /debug/pprof/：现场诊断（卡死/goroutine 泄漏/heap/CPU）。
+	// 显式注册到本 mux（net/http/pprof 的 init 只挂 DefaultServeMux）；
+	// ServeMux 最长前缀匹配保证它优先于 "/" 的 catch-all。
+	if pprofEnabled {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -801,6 +815,10 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 			log.Printf("stats server: %v", err)
 		}
 	}()
-	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns /top /metrics)", ln.Addr())
+	endpoints := "/ /json /healthz /readyz /conns /top /metrics"
+	if pprofEnabled {
+		endpoints += " /debug/pprof/{goroutine,heap,profile,trace...}"
+	}
+	log.Printf("stats server listening on %s (GET %s)", ln.Addr(), endpoints)
 	return srv
 }

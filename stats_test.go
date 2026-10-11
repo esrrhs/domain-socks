@@ -130,7 +130,7 @@ func TestStatsCountersAndGauges(t *testing.T) {
 func TestStatsHTTPEndpoints(t *testing.T) {
 	s := newStats()
 	s.inc(statUDPIn)
-	srv := startStatsServer("127.0.0.1:0", s, func() error { return nil })
+	srv := startStatsServer("127.0.0.1:0", s, func() error { return nil }, false)
 	if srv == nil {
 		t.Fatal("stats server failed to start on ephemeral port")
 	}
@@ -160,7 +160,7 @@ func TestStatsHTTPEndpoints(t *testing.T) {
 	}
 
 	// 无探针的实例不注册 /readyz（命中 / → 文本快照，404 由独立实例验证）
-	noProbe := startStatsServer("127.0.0.1:0", newStats(), nil)
+	noProbe := startStatsServer("127.0.0.1:0", newStats(), nil, false)
 	if noProbe == nil {
 		t.Fatal("setup: noProbe server failed")
 	}
@@ -204,15 +204,15 @@ func TestStatsHTTPEndpoints(t *testing.T) {
 	}
 
 	// 禁用与绑定失败都必须返回 nil（不能拖垮数据面）
-	if got := startStatsServer("", s, nil); got != nil {
+	if got := startStatsServer("", s, nil, false); got != nil {
 		t.Fatal("empty addr must disable the stats server")
 	}
-	occupied := startStatsServer("127.0.0.1:0", newStats(), nil)
+	occupied := startStatsServer("127.0.0.1:0", newStats(), nil, false)
 	if occupied == nil {
 		t.Fatal("setup: second ephemeral listener unexpectedly failed")
 	}
 	defer occupied.Close()
-	if got := startStatsServer(occupied.Addr, newStats(), nil); got != nil {
+	if got := startStatsServer(occupied.Addr, newStats(), nil, false); got != nil {
 		got.Close()
 		t.Fatal("bind conflict must return nil, not a half-started server")
 	}
@@ -492,7 +492,7 @@ func TestReadyzThroughHTTP(t *testing.T) {
 	srv := startStatsServer("127.0.0.1:0", newStats(), func() error {
 		calls++
 		return probeSocksUpstream(auth.addr(), "router", "secret")
-	})
+	}, false)
 	if srv == nil {
 		t.Fatal("stats server failed")
 	}
@@ -526,7 +526,7 @@ func TestReadyzThroughHTTP(t *testing.T) {
 	// 故障探针 → 503
 	bad := startStatsServer("127.0.0.1:0", newStats(), func() error {
 		return probeSocksUpstream("127.0.0.1:1", "", "")
-	})
+	}, false)
 	if bad == nil {
 		t.Fatal("bad-probe server failed")
 	}
@@ -742,7 +742,7 @@ func TestConnTrackerLifecycle(t *testing.T) {
 
 func TestConnsHTTPEndpoint(t *testing.T) {
 	s := newStats()
-	srv := startStatsServer("127.0.0.1:0", s, func() error { return nil })
+	srv := startStatsServer("127.0.0.1:0", s, func() error { return nil }, false)
 	if srv == nil {
 		t.Fatal("stats server failed")
 	}
@@ -847,7 +847,7 @@ func TestAggTable(t *testing.T) {
 
 func TestTopHTTPEndpoint(t *testing.T) {
 	s := newStats()
-	srv := startStatsServer("127.0.0.1:0", s, nil)
+	srv := startStatsServer("127.0.0.1:0", s, nil, false)
 	if srv == nil {
 		t.Fatal("stats server failed")
 	}
@@ -1030,7 +1030,7 @@ func TestPrometheusExposition(t *testing.T) {
 
 func TestMetricsHTTPEndpoint(t *testing.T) {
 	s := newStats()
-	srv := startStatsServer("127.0.0.1:0", s, nil)
+	srv := startStatsServer("127.0.0.1:0", s, nil, false)
 	if srv == nil {
 		t.Fatal("stats server failed")
 	}
@@ -1109,4 +1109,92 @@ func TestPrometheusTopExport(t *testing.T) {
 	if stripLiveMetrics(body) != stripLiveMetrics(s.renderPrometheus()) {
 		t.Fatal("top export rendering is not deterministic")
 	}
+}
+
+// TestPprofEndpoints 验证 -pprof 开关：关闭时 /debug/pprof/ 不暴露诊断
+// 内容（回落到 "/" 文本快照）；开启时索引页、goroutine 全栈、heap 文本
+// 与秒级 CPU profile 都可用且有实质内容。
+func TestPprofEndpoints(t *testing.T) {
+	get := func(base, path string) (int, []byte) {
+		t.Helper()
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+
+	// 1) 默认关闭：路径不返回 pprof 索引页
+	off := startStatsServer("127.0.0.1:0", newStats(), nil, false)
+	if off == nil {
+		t.Fatal("stats server failed")
+	}
+	defer off.Close()
+	code, body := get("http://"+off.Addr, "/debug/pprof/")
+	if code != 200 {
+		t.Fatalf("disabled pprof path status=%d", code)
+	}
+	if strings.Contains(string(body), "/debug/pprof/goroutine") {
+		t.Fatalf("pprof must not be exposed when disabled:\n%s", body)
+	}
+
+	// 2) 开启
+	srv := startStatsServer("127.0.0.1:0", newStats(), nil, true)
+	if srv == nil {
+		t.Fatal("pprof stats server failed")
+	}
+	defer srv.Close()
+	base := "http://" + srv.Addr
+
+	// 索引页列出各 profile
+	if code, idx := get(base, "/debug/pprof/"); code != 200 ||
+		!strings.Contains(string(idx), "goroutine") ||
+		!strings.Contains(string(idx), "heap") {
+		t.Fatalf("pprof index code=%d body=\n%s", code, idx)
+	}
+
+	// goroutine?debug=2：纯文本全 goroutine 栈，处理本请求的栈必然在内
+	if code, stacks := get(base, "/debug/pprof/goroutine?debug=2"); code != 200 ||
+		!strings.Contains(string(stacks), "goroutine ") ||
+		!strings.Contains(string(stacks), "net/http") {
+		t.Fatalf("goroutine dump code=%d len=%d head=%q", code, len(stacks), head(stacks))
+	}
+
+	// heap?debug=1：文本格式，含 runtime.MemStats 段
+	if code, hp := get(base, "/debug/pprof/heap?debug=1"); code != 200 ||
+		!strings.Contains(string(hp), "runtime.MemStats") {
+		t.Fatalf("heap text code=%d head=%q", code, head(hp))
+	}
+
+	// cmdline：200 且非空（os.Args[0]）
+	if code, cl := get(base, "/debug/pprof/cmdline"); code != 200 || len(cl) == 0 {
+		t.Fatalf("cmdline code=%d len=%d", code, len(cl))
+	}
+
+	// CPU profile：抓 1 秒，返回 gzip 压缩的 protobuf（魔数 1f 8b）且非空
+	profStart := time.Now()
+	if code, prof := get(base, "/debug/pprof/profile?seconds=1"); code != 200 ||
+		len(prof) < 16 || prof[0] != 0x1f || prof[1] != 0x8b {
+		t.Fatalf("cpu profile code=%d len=%d magic=%x", code, len(prof), first2(prof))
+	}
+	if d := time.Since(profStart); d < 900*time.Millisecond {
+		t.Fatalf("cpu profile returned too fast: %v (seconds=1 not honored?)", d)
+	}
+}
+
+func head(b []byte) string {
+	n := 200
+	if len(b) < n {
+		n = len(b)
+	}
+	return string(b[:n])
+}
+
+func first2(b []byte) []byte {
+	if len(b) < 2 {
+		return b
+	}
+	return b[:2]
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/signal"
 	"strings"
 	"sync"
@@ -38,7 +39,29 @@ func main() {
 	udpTProxy := flag.String("udp-tproxy", "", "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
 	statsAddr := flag.String("stats-addr", "127.0.0.1:18080", "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
 	accessLog := flag.Bool("access-log", true, "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
+	logFile := flag.String("log-file", "", "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
+	logMaxMB := flag.Int("log-max-mb", 1, "max size in MB of one log file before it is rotated to .1")
+	logBackups := flag.Int("log-backups", 3, "number of rotated backup files to keep (.1 newest .. .N oldest)")
 	flag.Parse()
+
+	// 文件日志尽早启用：后续参数校验的 log.Fatal 也要落进文件。
+	// 打开失败只告警并退回 stderr-only，与 stats 绑定失败同策略。
+	if *logFile != "" {
+		if *logMaxMB < 1 {
+			log.Fatal("-log-max-mb must be >= 1")
+		}
+		if *logBackups < 0 {
+			log.Fatal("-log-backups must be >= 0")
+		}
+		lw, err := newRotatingWriter(*logFile, int64(*logMaxMB)*1024*1024, *logBackups)
+		if err != nil {
+			log.Printf("warning: open log file %s: %v (continuing with stderr only)", *logFile, err)
+		} else {
+			log.SetOutput(io.MultiWriter(os.Stderr, lw))
+			defer lw.Close()
+			log.Printf("file logging enabled: %s (rotate at %dMiB, keep %d backups)", *logFile, *logMaxMB, *logBackups)
+		}
+	}
 
 	listenExplicitlySet := false
 	flag.Visit(func(f *flag.Flag) {

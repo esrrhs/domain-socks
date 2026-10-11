@@ -59,6 +59,9 @@ const (
 	// 连接时长直方图（固定桶，单位秒；连接关闭时 observe 一次）
 	histTCPProxyConnSeconds  = "tcp_proxy_conn_seconds"  // 经 SOCKS5 转发连接的总存活时长
 	histTCPDirectConnSeconds = "tcp_direct_conn_seconds" // 直连转发连接的总存活时长
+
+	// UDP flow 存活时长（flow 创建到空闲 sweep/网关关闭，与 /top flush 同点）
+	histUDPFlowSeconds = "udp_flow_seconds"
 )
 
 // dnsBuckets 比拨号桶更细：本地/快速上游常在 1~5ms，劣化时滑向
@@ -168,7 +171,7 @@ func newStats() *stats {
 		start:      time.Now(),
 		counters:   make(map[string]*atomic.Int64, len(keys)),
 		gauges:     make(map[string]func() int64),
-		histograms: make(map[string]*histogram, 6),
+		histograms: make(map[string]*histogram, 7),
 		conns:      newConnTracker(),
 		domains:    newAggTable(aggCapDomains),
 		clients:    newAggTable(aggCapClients),
@@ -182,6 +185,7 @@ func newStats() *stats {
 	s.histograms[histDNSUpstreamSeconds] = newHistogram(dnsBuckets)
 	s.histograms[histTCPProxyConnSeconds] = newHistogram(connBuckets)
 	s.histograms[histTCPDirectConnSeconds] = newHistogram(connBuckets)
+	s.histograms[histUDPFlowSeconds] = newHistogram(connBuckets)
 	// 内部 gauge 直接注册
 	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
@@ -507,6 +511,7 @@ var metricHelp = map[string]string{
 	histDNSUpstreamSeconds:   "Upstream DNS resolver round-trip time (incl. failures; local AAAA short-circuits excluded).",
 	histTCPProxyConnSeconds:  "Lifetime of proxied (SOCKS5) TCP connections from accept to close (incl. dial).",
 	histTCPDirectConnSeconds: "Lifetime of directly forwarded TCP connections from accept to close (incl. dial).",
+	histUDPFlowSeconds:       "Lifetime of UDP flows from creation to idle-sweep (2 min) or gateway close (traffic-bearing flows only).",
 }
 
 func promHelp(key string) string {

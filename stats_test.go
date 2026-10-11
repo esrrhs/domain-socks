@@ -303,6 +303,10 @@ func TestStatsGatewayWiring(t *testing.T) {
 	if got := st.snapshot().Counters[statAssocDown]; got != 0 {
 		t.Fatalf("shutdown must not count as teardown, got %d", got)
 	}
+	// Close flush 的 flow 必须记录一次存活时长（代理路径，sum>0）
+	if h := st.snapshot().Histograms[histUDPFlowSeconds]; h.Count != 1 || h.SumSeconds <= 0 {
+		t.Fatalf("udp flow lifetime histogram=%+v want count=1 sum>0", h)
+	}
 
 	// Close flush 了 UDP flow：/top 两张表都应含本次代理流量
 	drows := st.domains.top(10)

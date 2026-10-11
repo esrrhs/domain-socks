@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -631,14 +632,28 @@ func TestUDPFlowAggregationFlush(t *testing.T) {
 	waitUDPReply(t, r1, "AAAAA")
 	waitUDPReply(t, r2, "BBB")
 
-	// 强制两条 flow 空闲过期后 sweep
+	// 强制两条 flow 空闲过期后 sweep；created 拨到 45s 前以校验
+	// 存活时长按创建时刻计量（与 lastSeen 无关），应越过 30s 落入 60s 桶。
 	gw.mu.Lock()
 	old := time.Now().Add(-(udpFlowIdle + time.Second))
+	aged := time.Now().Add(-45 * time.Second)
 	for _, f := range gw.flows {
 		f.lastSeen = old
+		f.created = aged
 	}
 	gw.mu.Unlock()
 	gw.sweep()
+
+	h := st.snapshot().Histograms[histUDPFlowSeconds]
+	if h.Count != 2 || h.SumSeconds < 90 {
+		t.Fatalf("udp flow histogram=%+v want count=2 sum>=90", h)
+	}
+	idx30 := sort.SearchFloat64s(connBuckets, 30)
+	idx60 := sort.SearchFloat64s(connBuckets, 60)
+	if h.CumulativeCounts[idx30] != 0 || h.CumulativeCounts[idx60] != 2 {
+		t.Fatalf("45s flows bucket wrong: le=30=%d le=60=%d cum=%v",
+			h.CumulativeCounts[idx30], h.CumulativeCounts[idx60], h.CumulativeCounts)
+	}
 
 	if n := len(gw.flows); n != 0 {
 		t.Fatalf("flows after sweep=%d want 0", n)
@@ -669,10 +684,13 @@ func TestUDPFlowAggregationFlush(t *testing.T) {
 		t.Fatalf("client rows=%+v want 192.168.1.77 up/down=8", crows)
 	}
 
-	// 再 sweep / Close 不得重复 flush
+	// 再 sweep / Close 不得重复 flush（聚合与直方图都不得重复）
 	gw.sweep()
 	gw.Close()
 	if got := st.domains.top(10); got[0].conns != 2 {
 		t.Fatalf("double flush detected: %+v", got)
+	}
+	if h := st.snapshot().Histograms[histUDPFlowSeconds]; h.Count != 2 {
+		t.Fatalf("flow histogram double-observed: count=%d want 2", h.Count)
 	}
 }

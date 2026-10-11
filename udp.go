@@ -49,6 +49,7 @@ type udpFlow struct {
 	clientKey string
 	target    string // host:port，与上游回包头中的地址严格一致
 	reply     func([]byte) error
+	created   time.Time
 	lastSeen  time.Time
 
 	// /top 聚合在 flow 过期/关闭时一次性 flush（非每包加锁）：
@@ -142,12 +143,13 @@ func clientHostFromKey(key string) string {
 
 // flushFlowStats 把已终结（过期/网关关闭）的 UDP flow 累计值写入 /top
 // 聚合，每个 flow 只写一次。零流量 flow（建在转发失败前）不产生记录，
-// 与 TCP 拨号失败不聚合的口径一致。
+// 与 TCP 拨号失败不聚合的口径一致；存活时长直方图走同一道闸门。
 func (g *udpGateway) flushFlowStats(flows []*udpFlow) {
 	for _, f := range flows {
 		if f.up == 0 && f.down == 0 {
 			continue
 		}
+		g.stats.observe(histUDPFlowSeconds, time.Since(f.created))
 		g.stats.recordFlow(f.host, clientHostFromKey(f.clientKey), f.via, f.up, f.down)
 	}
 }
@@ -244,6 +246,7 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 			clientKey: clientKey,
 			target:    flowKey,
 			reply:     reply,
+			created:   time.Now(),
 			lastSeen:  time.Now(),
 			host:      target,
 			via:       via,

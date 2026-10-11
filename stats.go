@@ -186,10 +186,33 @@ func sortedKeys(m map[string]int64) []string {
 	return keys
 }
 
+// readinessCache 给就绪探测加一个很短的结果缓存：多个监控系统同时抓取
+// /readyz 时不会把上游 SOCKS 拨号打爆。探测本身有 5s 超时兜底。
+type readinessCache struct {
+	probe   func() error
+	ttl     time.Duration
+	mu      sync.Mutex
+	last    time.Time
+	lastErr error
+}
+
+func (rc *readinessCache) check() error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if !rc.last.IsZero() && time.Since(rc.last) < rc.ttl {
+		return rc.lastErr
+	}
+	err := rc.probe()
+	rc.last = time.Now()
+	rc.lastErr = err
+	return err
+}
+
 // startStatsServer 启动只读指标 HTTP 服务。addr 为空表示禁用；
 // 绑定失败不致命（端口冲突不应拖垮代理数据面），仅告警并返回 nil。
 // 默认 127.0.0.1:18080 只对本机可达；显式绑定 0.0.0.0/:: 会向 LAN 暴露。
-func startStatsServer(addr string, s *stats) *http.Server {
+// readyCheck 非 nil 时注册 /readyz（对上游做只读协商探测）。
+func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Server {
 	if addr == "" || s == nil {
 		return nil
 	}
@@ -206,6 +229,30 @@ func startStatsServer(addr string, s *stats) *http.Server {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(s.snapshot())
 	})
+	// /healthz：进程与 HTTP 事件循环存活即 200（liveness），不依赖外部组件
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprintln(w, "ok")
+	})
+	// /readyz：对上游 SOCKS5 做只读握手探测。探针未配置时明确 503，
+	// 而不是落到 "/" 的文本快照让监控拿到假阳性的 200。
+	rc := &readinessCache{probe: readyCheck, ttl: 2 * time.Second}
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if readyCheck == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintln(w, "not ready: readiness probe not configured")
+			return
+		}
+		if err := rc.check(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "not ready: %v\n", err)
+			return
+		}
+		_, _ = fmt.Fprintln(w, "ready")
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -217,6 +264,6 @@ func startStatsServer(addr string, s *stats) *http.Server {
 			log.Printf("stats server: %v", err)
 		}
 	}()
-	log.Printf("stats server listening on %s (GET / or /json)", ln.Addr())
+	log.Printf("stats server listening on %s (GET / /json /healthz /readyz)", ln.Addr())
 	return srv
 }

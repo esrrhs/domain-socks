@@ -116,7 +116,11 @@ func main() {
 		"udp_active_flows":   func() int64 { _, n := gw.activeCounts(); return n },
 		"udp_assoc_up":       gw.proxy.assocIsUp,
 	})
-	statsSrv := startStatsServer(*statsAddr, appStats)
+	// /readyz 对上游 SOCKS5 做只读握手探测（不发 CONNECT，无目标流量）
+	readyCheck := func() error {
+		return probeSocksUpstream(*socks, *socksUser, *socksPass)
+	}
+	statsSrv := startStatsServer(*statsAddr, appStats, readyCheck)
 
 	gwCtx, gwCancel := context.WithCancel(context.Background())
 	defer gwCancel()

@@ -61,6 +61,23 @@ const (
 	socksCmdUDPAssociate = 0x03
 )
 
+// socksProbeTimeout 是就绪探测的总预算（拨号+方法协商+认证）
+const socksProbeTimeout = 5 * time.Second
+
+// probeSocksUpstream 仅完成 SOCKS5 方法协商（含 RFC1929 认证），不发送
+// CONNECT/ASSOCIATE 请求，因此不会经上游产生任何目标流量。用于 /readyz：
+// 验证上游 TCP 可达、协议正确、凭据有效。刻意不占用 handshakeSlots，
+// 避免数据面并发占满时探测被排队而导致就绪状态假性抖动。
+func probeSocksUpstream(addr, user, pass string) error {
+	conn, err := net.DialTimeout("tcp", addr, socksProbeTimeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(socksProbeTimeout))
+	return socksNegotiate(conn, user, pass)
+}
+
 // socksNegotiate 完成 SOCKS5 方法协商与可选的 RFC 1929 用户名/密码认证。
 // TCP CONNECT 与 UDP ASSOCIATE 共用，两条路径不得各自实现以免行为漂移。
 func socksNegotiate(conn net.Conn, user string, pass string) error {

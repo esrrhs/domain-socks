@@ -229,7 +229,11 @@ func (f *aaaaFilter) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 			}
 		}
 	}
+	// 仅真实上游往返进延迟直方图；AAAA 本地短路在上方已返回。
+	// 成功与失败都记录：慢超时正是 DNS 平面劣化信号。
+	dnsStart := time.Now()
 	resp, err := f.Resolver.Exchange(ctx, req)
+	f.st.observe(histDNSUpstreamSeconds, time.Since(dnsStart))
 	if err != nil {
 		f.st.inc(statDNSErrors)
 		return nil, err

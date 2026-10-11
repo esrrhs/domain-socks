@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -223,6 +224,8 @@ type stubExchangeResolver struct {
 	isFake func(net.IP) bool
 	// fail 非 nil 时 Exchange 直接返回该错误
 	fail error
+	// delay 非零时 Exchange 先 sleep，用于模拟上游延迟
+	delay time.Duration
 }
 
 func (s *stubExchangeResolver) ShouldProxy(target string) (bool, error) {
@@ -235,6 +238,13 @@ func (s *stubExchangeResolver) IsFakeIP(ip net.IP) bool {
 
 func (s *stubExchangeResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	s.upstreamHits++
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.fail != nil {
 		return nil, s.fail
 	}
@@ -365,6 +375,75 @@ func TestDNSMetrics(t *testing.T) {
 	}
 	if stub.upstreamHits != 4 { // aaaaDirect + aReq + failed aReq + disabled aaaaProxy
 		t.Fatalf("upstreamHits=%d want 4", stub.upstreamHits)
+	}
+	// 恰好 4 次真实上游往返进延迟直方图（含 1 次失败），
+	// 被本地短路的代理 AAAA 不计入。
+	if h := st.snapshot().Histograms[histDNSUpstreamSeconds]; h.Count != 4 || h.SumSeconds <= 0 {
+		t.Fatalf("dns upstream histogram=%+v want count=4 sum>0", h)
+	}
+}
+
+// TestDNSUpstreamLatencyHistogram 验证延迟直方图的短路排除、
+// 延迟桶归属与失败观测。
+func TestDNSUpstreamLatencyHistogram(t *testing.T) {
+	stub := &stubExchangeResolver{
+		proxyDomains: map[string]bool{"www.google.com": true},
+		delay:        5 * time.Millisecond,
+	}
+	st := newStats()
+	f := &aaaaFilter{Resolver: stub, st: st, enabled: true}
+
+	// 代理 AAAA：本地短路，零上游观测
+	aaaaProxy := new(dns.Msg)
+	aaaaProxy.SetQuestion("www.google.com.", dns.TypeAAAA)
+	if _, err := f.Exchange(context.Background(), aaaaProxy); err != nil {
+		t.Fatal(err)
+	}
+	if h := st.snapshot().Histograms[histDNSUpstreamSeconds]; h.Count != 0 {
+		t.Fatalf("short-circuit AAAA must not hit histogram, count=%d", h.Count)
+	}
+
+	// A 查询：5ms 延迟必须落在 >=5ms 的累计桶且 sum>=5ms
+	aReq := new(dns.Msg)
+	aReq.SetQuestion("www.google.com.", dns.TypeA)
+	if _, err := f.Exchange(context.Background(), aReq); err != nil {
+		t.Fatal(err)
+	}
+	h := st.snapshot().Histograms[histDNSUpstreamSeconds]
+	if h.Count != 1 || h.SumSeconds < 0.005 {
+		t.Fatalf("after delayed A query histogram=%+v want count=1 sum>=0.005", h)
+	}
+	// 不假设调度器把 5ms sleep 唤醒到哪个具体桶（常为 5~10ms），
+	// 只校验：2ms 桶必不含（sleep 不会提前）、尾桶必含，且某个桶
+	// 从 0 跳变到 1（单调累计）。
+	idx002 := sort.SearchFloat64s(dnsBuckets, 0.002)
+	if h.CumulativeCounts[idx002] != 0 {
+		t.Fatalf("5ms sleep must not land in le=0.002, cum=%v", h.CumulativeCounts)
+	}
+	if h.CumulativeCounts[len(h.CumulativeCounts)-1] != 1 {
+		t.Fatalf("+Inf cumulative=%d want 1", h.CumulativeCounts[len(h.CumulativeCounts)-1])
+	}
+	var sawOne bool
+	for _, v := range h.CumulativeCounts {
+		if v == 1 {
+			sawOne = true
+		}
+		if v < 0 || v > 1 {
+			t.Fatalf("cumulative counts must be 0/1 monotonic: %v", h.CumulativeCounts)
+		}
+	}
+	if !sawOne {
+		t.Fatalf("sample missing from all buckets: %v", h.CumulativeCounts)
+	}
+
+	// 失败的上游调用同样观测（慢失败也是信号）
+	stub.delay = 0
+	stub.fail = fmt.Errorf("dns timeout")
+	if _, err := f.Exchange(context.Background(), aReq); err == nil {
+		t.Fatal("expected error propagation")
+	}
+	if h := st.snapshot().Histograms[histDNSUpstreamSeconds]; h.Count != 2 {
+		t.Fatalf("failed upstream call must be observed, count=%d want 2", h.Count)
 	}
 }
 

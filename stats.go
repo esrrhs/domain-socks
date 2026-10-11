@@ -54,7 +54,15 @@ const (
 	histTCPProxyDialSeconds  = "tcp_proxy_dial_seconds"  // SOCKS5 拨号+协商+CONNECT 总耗时
 	histTCPDirectDialSeconds = "tcp_direct_dial_seconds" // 直连 net.Dial 耗时
 	histUDPAssocDialSeconds  = "udp_assoc_dial_seconds"  // UDP ASSOCIATE 拨号+握手耗时
+	histDNSUpstreamSeconds   = "dns_upstream_seconds"    // 上游 DNS 解析往返耗时
 )
+
+// dnsBuckets 比拨号桶更细：本地/快速上游常在 1~5ms，劣化时滑向
+// 50ms~1s，超过 2s 通常已逼近解析超时；AAAA 本地短路不进此图。
+var dnsBuckets = []float64{
+	0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+	0.1, 0.2, 0.5, 1, 2, 5, 10,
+}
 
 // dialBuckets 覆盖拨号延迟的关心区间：局域网 SOCKS5 通常 <10ms，
 // 经公网上游劣化时落在 100ms~2s，8s/12s 超时的失败落入 +Inf 前的末档。
@@ -149,7 +157,7 @@ func newStats() *stats {
 		start:      time.Now(),
 		counters:   make(map[string]*atomic.Int64, len(keys)),
 		gauges:     make(map[string]func() int64),
-		histograms: make(map[string]*histogram, 3),
+		histograms: make(map[string]*histogram, 4),
 		conns:      newConnTracker(),
 		domains:    newAggTable(aggCapDomains),
 		clients:    newAggTable(aggCapClients),
@@ -160,6 +168,7 @@ func newStats() *stats {
 	s.histograms[histTCPProxyDialSeconds] = newHistogram(dialBuckets)
 	s.histograms[histTCPDirectDialSeconds] = newHistogram(dialBuckets)
 	s.histograms[histUDPAssocDialSeconds] = newHistogram(dialBuckets)
+	s.histograms[histDNSUpstreamSeconds] = newHistogram(dnsBuckets)
 	// 内部 gauge 直接注册
 	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
@@ -482,6 +491,7 @@ var metricHelp = map[string]string{
 	histTCPProxyDialSeconds:  "Time spent in SOCKS5 dial+negotiate+CONNECT (incl. failures).",
 	histTCPDirectDialSeconds: "Time spent in direct TCP dial (incl. failures).",
 	histUDPAssocDialSeconds:  "Time spent in UDP ASSOCIATE dial+handshake (incl. failures; cooldown fast-fails excluded).",
+	histDNSUpstreamSeconds:   "Upstream DNS resolver round-trip time (incl. failures; local AAAA short-circuits excluded).",
 }
 
 func promHelp(key string) string {

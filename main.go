@@ -328,9 +328,12 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 		case "socks":
 			st.add(statTCPProxyBytesUp, up)
 			st.add(statTCPProxyBytesDown, down)
+			// 连接存活时长（accept→关闭，含拨号），dst-fail/captive204 不进
+			st.observe(histTCPProxyConnSeconds, time.Since(start))
 		case "direct":
 			st.add(statTCPDirectBytesUp, up)
 			st.add(statTCPDirectBytesDown, down)
+			st.observe(histTCPDirectConnSeconds, time.Since(start))
 		}
 		// /top 聚合：按目标域名(或 IP)与客户端 IP 各记一次
 		targetHost, _, _ := net.SplitHostPort(target)

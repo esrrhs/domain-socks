@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -321,6 +322,13 @@ func TestHandleConnByteCounting(t *testing.T) {
 	if hists[histTCPProxyDialSeconds].Count != 0 {
 		t.Fatalf("proxy dial histogram must stay zero, got %d", hists[histTCPProxyDialSeconds].Count)
 	}
+	// 直连连接关闭后记录一次存活时长；代理时长直方图保持零
+	if hists[histTCPDirectConnSeconds].Count != 1 || hists[histTCPDirectConnSeconds].SumSeconds <= 0 {
+		t.Fatalf("direct conn histogram=%+v want count=1 sum>0", hists[histTCPDirectConnSeconds])
+	}
+	if hists[histTCPProxyConnSeconds].Count != 0 {
+		t.Fatalf("proxy conn histogram must stay zero, got %d", hists[histTCPProxyConnSeconds].Count)
+	}
 	// 关闭后流量必须进入 /top 聚合（回环场景 client 与 target 同为 127.0.0.1）
 	top := st.renderTop()
 	for _, want := range []string{"top domains", "top clients", "127.0.0.1"} {
@@ -370,6 +378,8 @@ func TestHandleConnProxyDialHistogram(t *testing.T) {
 			return
 		}
 		all, _ := io.ReadAll(c)
+		// 持连 150ms：端到端验证存活时长按真实墙钟计入（非拨号耗时）
+		time.Sleep(150 * time.Millisecond)
 		_, _ = c.Write(append([]byte("ECHO:"), all...))
 	}()
 
@@ -438,6 +448,22 @@ func TestHandleConnProxyDialHistogram(t *testing.T) {
 	}
 	if snap.Histograms[histTCPDirectDialSeconds].Count != 0 {
 		t.Fatalf("direct dial histogram must stay zero")
+	}
+	// 连接存活时长：mock 持连 150ms，样本必须越过 0.1s 桶
+	// （sleep 只可能被调度延后），sum>=150ms，直连时长图保持零。
+	ch := snap.Histograms[histTCPProxyConnSeconds]
+	if ch.Count != 1 || ch.SumSeconds < 0.15 {
+		t.Fatalf("proxy conn histogram=%+v want count=1 sum>=0.15", ch)
+	}
+	idx01 := sort.SearchFloat64s(connBuckets, 0.1)
+	if ch.CumulativeCounts[idx01] != 0 {
+		t.Fatalf("150ms conn must not land in le=0.1, cum=%v", ch.CumulativeCounts)
+	}
+	if ch.CumulativeCounts[len(ch.CumulativeCounts)-1] != 1 {
+		t.Fatalf("proxy conn +Inf cumulative=%d want 1", ch.CumulativeCounts[len(ch.CumulativeCounts)-1])
+	}
+	if snap.Histograms[histTCPDirectConnSeconds].Count != 0 {
+		t.Fatalf("direct conn histogram must stay zero, got %d", snap.Histograms[histTCPDirectConnSeconds].Count)
 	}
 }
 

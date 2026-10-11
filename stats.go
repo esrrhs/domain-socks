@@ -55,6 +55,10 @@ const (
 	histTCPDirectDialSeconds = "tcp_direct_dial_seconds" // 直连 net.Dial 耗时
 	histUDPAssocDialSeconds  = "udp_assoc_dial_seconds"  // UDP ASSOCIATE 拨号+握手耗时
 	histDNSUpstreamSeconds   = "dns_upstream_seconds"    // 上游 DNS 解析往返耗时
+
+	// 连接时长直方图（固定桶，单位秒；连接关闭时 observe 一次）
+	histTCPProxyConnSeconds  = "tcp_proxy_conn_seconds"  // 经 SOCKS5 转发连接的总存活时长
+	histTCPDirectConnSeconds = "tcp_direct_conn_seconds" // 直连转发连接的总存活时长
 )
 
 // dnsBuckets 比拨号桶更细：本地/快速上游常在 1~5ms，劣化时滑向
@@ -69,6 +73,13 @@ var dnsBuckets = []float64{
 var dialBuckets = []float64{
 	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
 	0.1, 0.25, 0.5, 1, 2, 5, 10,
+}
+
+// connBuckets 覆盖连接会话长度（接受连接到关闭，含拨号）：短请求常在
+// 亚秒~数秒，长连（keep-alive/流式/推送）数十秒到数分钟，超过 1h 折叠进 +Inf。
+var connBuckets = []float64{
+	0.1, 0.25, 0.5, 1, 2, 5, 10,
+	30, 60, 180, 600, 1800, 3600,
 }
 
 // histogram 是固定上界延迟分布（零依赖；观测热路径只有一次原子 Add）。
@@ -157,7 +168,7 @@ func newStats() *stats {
 		start:      time.Now(),
 		counters:   make(map[string]*atomic.Int64, len(keys)),
 		gauges:     make(map[string]func() int64),
-		histograms: make(map[string]*histogram, 4),
+		histograms: make(map[string]*histogram, 6),
 		conns:      newConnTracker(),
 		domains:    newAggTable(aggCapDomains),
 		clients:    newAggTable(aggCapClients),
@@ -169,6 +180,8 @@ func newStats() *stats {
 	s.histograms[histTCPDirectDialSeconds] = newHistogram(dialBuckets)
 	s.histograms[histUDPAssocDialSeconds] = newHistogram(dialBuckets)
 	s.histograms[histDNSUpstreamSeconds] = newHistogram(dnsBuckets)
+	s.histograms[histTCPProxyConnSeconds] = newHistogram(connBuckets)
+	s.histograms[histTCPDirectConnSeconds] = newHistogram(connBuckets)
 	// 内部 gauge 直接注册
 	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
@@ -492,6 +505,8 @@ var metricHelp = map[string]string{
 	histTCPDirectDialSeconds: "Time spent in direct TCP dial (incl. failures).",
 	histUDPAssocDialSeconds:  "Time spent in UDP ASSOCIATE dial+handshake (incl. failures; cooldown fast-fails excluded).",
 	histDNSUpstreamSeconds:   "Upstream DNS resolver round-trip time (incl. failures; local AAAA short-circuits excluded).",
+	histTCPProxyConnSeconds:  "Lifetime of proxied (SOCKS5) TCP connections from accept to close (incl. dial).",
+	histTCPDirectConnSeconds: "Lifetime of directly forwarded TCP connections from accept to close (incl. dial).",
 }
 
 func promHelp(key string) string {

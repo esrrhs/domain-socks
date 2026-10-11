@@ -637,6 +637,8 @@ func TestHistogramExposedInSnapshots(t *testing.T) {
 	s := newStats()
 	s.observe(histTCPProxyDialSeconds, 5*time.Millisecond)
 	s.observe(histTCPDirectDialSeconds, 50*time.Millisecond)
+	s.observe(histTCPProxyConnSeconds, 3*time.Second)
+	s.observe(histTCPDirectConnSeconds, 200*time.Millisecond)
 
 	// JSON 快照含两张直方图且数值合法（+Inf 不得进入 JSON）
 	jb, err := json.Marshal(s.snapshot())
@@ -653,6 +655,10 @@ func TestHistogramExposedInSnapshots(t *testing.T) {
 	if decoded.Histograms[histTCPDirectDialSeconds].Count != 1 {
 		t.Fatalf("direct dial count in json snapshot=%v", decoded.Histograms)
 	}
+	if decoded.Histograms[histTCPProxyConnSeconds].Count != 1 ||
+		decoded.Histograms[histTCPDirectConnSeconds].Count != 1 {
+		t.Fatalf("conn hist counts in json snapshot=%v want 1/1", decoded.Histograms)
+	}
 	if strings.Contains(string(jb), "Inf") {
 		t.Fatalf("JSON must not contain Inf:\n%s", jb)
 	}
@@ -661,6 +667,7 @@ func TestHistogramExposedInSnapshots(t *testing.T) {
 	text := s.renderText()
 	if !strings.Contains(text, "histograms:") ||
 		!strings.Contains(text, histTCPProxyDialSeconds) ||
+		!strings.Contains(text, histTCPProxyConnSeconds) ||
 		!strings.Contains(text, "le=") ||
 		!strings.Contains(text, "+Inf") {
 		t.Fatalf("text snapshot missing histogram section:\n%s", text)

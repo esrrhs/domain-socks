@@ -456,3 +456,12 @@ IPv4-only `REDIRECT` to dual-stack `TPROXY` (install `kmod-ipt-tproxy`,
 both modes when `kmod-ipt-nat6` is present. Policy-routing `ip rule`
 entries are left in place on stop because they may be shared with other
 services; the stop function's comments document the manual cleanup commands.
+
+### Signals & graceful shutdown
+
+On `SIGINT`/`SIGTERM` (i.e. `/etc/init.d/domain-socks stop|restart`) the daemon stops accepting new connections and UDP clients, then drains in two phases so the per-connection bookkeeping (access log line, byte counters, `/top` aggregation, session-length histogram) is flushed instead of being lost with the process:
+
+1. a **1s grace period** lets short, in-flight requests finish on their own;
+2. remaining client connections are then **force-closed**, which unblocks their `io.Copy` loops and runs the close-time defers; the UDP gateway's close path flushes idle-flow stats at the same point.
+
+The whole shutdown is bounded by a **3s budget**, well inside procd's default 5s `term_timeout` (so it never relies on `SIGKILL`). A graceful stop — even one that had to abandon a connection stuck in a context-less dial — exits with code 0 so procd does not count it as a crash. Sending `SIGTERM`/`SIGINT` a **second time** skips the drain and exits immediately with code 1; every shutdown step is logged to stderr and the rotating log file.

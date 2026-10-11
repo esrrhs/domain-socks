@@ -20,9 +20,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// shutdownDrainTimeout 限制优雅退出时等待在途连接收尾的最长时间
-const shutdownDrainTimeout = 3 * time.Second
-
 func main() {
 	socks := flag.String("socks", "192.168.1.101:1081", "upstream socks5")
 	socksUser := flag.String("socks-user", "", "upstream socks5 username")
@@ -207,15 +204,20 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	active := newConnRegistry()
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			// 同步登记（在 go 之前），关闭扫描时不会漏掉已 accept
+			// 但尚未调度的连接。
+			active.add(c)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				defer active.remove(c)
 				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf, appStats, *accessLog)
 			}()
 		}
@@ -224,6 +226,9 @@ func main() {
 	// 6. 等待退出信号并优雅关闭
 	<-ctx.Done()
 	log.Printf("shutdown signal received, draining connections...")
+	// 第二个 SIGINT/SIGTERM：放弃排空立即退出（procd 的 SIGKILL 兜底同理）
+	hardExit := make(chan os.Signal, 1)
+	signal.Notify(hardExit, syscall.SIGINT, syscall.SIGTERM)
 	if stopUDP != nil {
 		stopUDP()
 	}
@@ -235,17 +240,19 @@ func main() {
 	_ = ln.Close()
 	_ = dnsServer.Stop()
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(shutdownDrainTimeout):
-		log.Printf("drain timeout (%v), forcing exit with active connections", shutdownDrainTimeout)
+	// 两阶段排空：宽限期内让短请求自然结束；随后强关仍存活的连接，
+	// 使 handleConn 的统计/日志 defer 在进程退出前执行落账。
+	drained, hard := waitForShutdown(&wg, active, hardExit)
+	if drained {
+		log.Printf("shutdown complete: all in-flight connections drained")
 	}
 	_ = resolver.Close()
+	if hard {
+		// 第二个 SIGTERM/SIGINT：管理员明确要求立即退出
+		os.Exit(1)
+	}
+	// drained=false（预算耗尽放弃卡死连接）仍以 0 退出：进程是被
+	// SIGTERM 礼貌关停的，不应被 procd 记为一次崩溃。
 }
 
 // aaaaFilter 包装 gohome Resolver，承担两件事：

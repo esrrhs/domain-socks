@@ -539,3 +539,101 @@ func TestReadinessCache(t *testing.T) {
 		t.Fatalf("cached failure: calls=%d", calls)
 	}
 }
+
+func TestHistogramBuckets(t *testing.T) {
+	bounds := []float64{0.001, 0.01, 1}
+	h := newHistogram(bounds)
+
+	// 等上界归属（le 语义）：0 与恰为 1ms 都进首桶
+	h.observe(0)
+	h.observe(1 * time.Millisecond)
+	h.observe(2 * time.Millisecond) // 第二桶 (1ms,10ms]
+	h.observe(10 * time.Millisecond)
+	h.observe(500 * time.Millisecond) // 第三桶 (10ms,1s]
+	h.observe(1 * time.Second)        // 恰好等于上界仍进第三桶
+	h.observe(2 * time.Second)        // +Inf
+
+	snap := h.snapshot()
+	if snap.Count != 7 {
+		t.Fatalf("count=%d want 7", snap.Count)
+	}
+	wantRaw := []int64{2, 2, 2, 1} // 原始每桶计数
+	var gotRaw []int64
+	cum := snap.CumulativeCounts
+	for i := range cum {
+		var prev int64
+		if i > 0 {
+			prev = cum[i-1]
+		}
+		gotRaw = append(gotRaw, cum[i]-prev)
+	}
+	if len(gotRaw) != len(wantRaw) {
+		t.Fatalf("bucket count=%d want %d (finite bounds + +Inf)", len(gotRaw), len(wantRaw))
+	}
+	for i := range wantRaw {
+		if gotRaw[i] != wantRaw[i] {
+			t.Fatalf("raw bucket[%d]=%d want %d (cum=%v)", i, gotRaw[i], wantRaw[i], cum)
+		}
+	}
+	// 累计末值必须等于总样本数
+	if cum[len(cum)-1] != 7 {
+		t.Fatalf("+Inf cumulative=%d want 7", cum[len(cum)-1])
+	}
+	// 边界切片不暴露内部可变数组（快照应可独立持有）
+	snap.BucketsLE[0] = 999
+	if h.buckets[0] != 0.001 {
+		t.Fatal("snapshot must not alias the internal bucket slice")
+	}
+	// sum：0+1ms+2ms+10ms+500ms+1s+2s = 3.513s
+	if got := snap.SumSeconds; got < 3.512 || got > 3.514 {
+		t.Fatalf("sum=%.6f want ~3.513", got)
+	}
+}
+
+func TestHistogramSafety(t *testing.T) {
+	var nilH *histogram
+	nilH.observe(time.Second) // 必须不 panic
+	nilH.observe(-1)          // 负值忽略
+
+	h := newHistogram([]float64{1})
+	h.observe(-5 * time.Second)
+	if h.snapshot().Count != 0 {
+		t.Fatal("negative observation must be dropped")
+	}
+	var nilStats *stats
+	nilStats.observe(histTCPProxyDialSeconds, time.Second) // nil stats 安全
+}
+
+func TestHistogramExposedInSnapshots(t *testing.T) {
+	s := newStats()
+	s.observe(histTCPProxyDialSeconds, 5*time.Millisecond)
+	s.observe(histTCPDirectDialSeconds, 50*time.Millisecond)
+
+	// JSON 快照含两张直方图且数值合法（+Inf 不得进入 JSON）
+	jb, err := json.Marshal(s.snapshot())
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var decoded statsJSON
+	if err := json.Unmarshal(jb, &decoded); err != nil {
+		t.Fatalf("histogram snapshot must be valid JSON: %v", err)
+	}
+	if decoded.Histograms[histTCPProxyDialSeconds].Count != 1 {
+		t.Fatalf("proxy dial count in json snapshot=%v", decoded.Histograms)
+	}
+	if decoded.Histograms[histTCPDirectDialSeconds].Count != 1 {
+		t.Fatalf("direct dial count in json snapshot=%v", decoded.Histograms)
+	}
+	if strings.Contains(string(jb), "Inf") {
+		t.Fatalf("JSON must not contain Inf:\n%s", jb)
+	}
+
+	// 文本快照含直方图段与桶行
+	text := s.renderText()
+	if !strings.Contains(text, "histograms:") ||
+		!strings.Contains(text, histTCPProxyDialSeconds) ||
+		!strings.Contains(text, "le=") ||
+		!strings.Contains(text, "+Inf") {
+		t.Fatalf("text snapshot missing histogram section:\n%s", text)
+	}
+}

@@ -312,4 +312,123 @@ func TestHandleConnByteCounting(t *testing.T) {
 		t.Fatalf("proxy byte counters must stay zero, got up=%d down=%d",
 			snap[statTCPProxyBytesUp], snap[statTCPProxyBytesDown])
 	}
+	// 直连拨号必须被直方图记录一次（代理直方图保持零）
+	hists := st.snapshot().Histograms
+	if hists[histTCPDirectDialSeconds].Count != 1 {
+		t.Fatalf("direct dial histogram count=%d want 1", hists[histTCPDirectDialSeconds].Count)
+	}
+	if hists[histTCPProxyDialSeconds].Count != 0 {
+		t.Fatalf("proxy dial histogram must stay zero, got %d", hists[histTCPProxyDialSeconds].Count)
+	}
+}
+
+// TestHandleConnProxyDialHistogram 走完整 handleConn 代理路径：真实
+// socksConnect 对 mock SOCKS5 发 CONNECT，验证代理拨号直方图与代理
+// 字节计数接线（与直连路径测试成对覆盖）。
+func TestHandleConnProxyDialHistogram(t *testing.T) {
+	// mock SOCKS5：免密协商 + IPv4 CONNECT 成功 + 回显载荷
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+	go func() {
+		c, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		hdr := make([]byte, 2)
+		if _, err := io.ReadFull(c, hdr); err != nil || hdr[0] != 0x05 {
+			return
+		}
+		methods := make([]byte, hdr[1])
+		if _, err := io.ReadFull(c, methods); err != nil {
+			return
+		}
+		if _, err := c.Write([]byte{0x05, 0x00}); err != nil { // 免密
+			return
+		}
+		reqHdr := make([]byte, 4)
+		if _, err := io.ReadFull(c, reqHdr); err != nil || reqHdr[1] != socksCmdConnect || reqHdr[3] != 0x01 {
+			return
+		}
+		addr4 := make([]byte, 6) // 4B ip + 2B port
+		if _, err := io.ReadFull(c, addr4); err != nil {
+			return
+		}
+		if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			return
+		}
+		all, _ := io.ReadAll(c)
+		_, _ = c.Write(append([]byte("ECHO:"), all...))
+	}()
+
+	frontLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frontLn.Close()
+
+	// dstIP 127.0.0.1 被判为代理域名 -> 走 SOCKS5，且无嗅探域名 -> ATYP=0x01
+	res := &stubExchangeResolver{proxyDomains: map[string]bool{"127.0.0.1": true}}
+	st := newStats()
+	dstOf := func(net.Conn) (net.IP, int, error) {
+		return net.ParseIP("127.0.0.1"), 9, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		c, err := frontLn.Accept()
+		if err != nil {
+			t.Errorf("front accept: %v", err)
+			close(done)
+			return
+		}
+		handleConn(c, res, socksLn.Addr().String(), "", "", dstOf, st, false)
+		close(done)
+	}()
+
+	cc, err := net.DialTimeout("tcp", frontLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "PROXY-PAYLOAD" // 非 HTTP/TLS 首字节，嗅探放弃 -> prefix 重放
+	if _, err := cc.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	_ = cc.(*net.TCPConn).CloseWrite()
+	reply, err := io.ReadAll(cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cc.Close()
+	<-done
+
+	if want := "ECHO:" + payload; string(reply) != want {
+		t.Fatalf("reply=%q want %q", reply, want)
+	}
+	snap := st.snapshot()
+	if snap.Counters[statTCPProxy] != 1 || snap.Counters[statTCPSocksFail] != 0 {
+		t.Fatalf("proxy=%d socks_fail=%d want 1/0", snap.Counters[statTCPProxy], snap.Counters[statTCPSocksFail])
+	}
+	if snap.Counters[statTCPProxyBytesUp] != int64(len(payload)) {
+		t.Fatalf("proxy up bytes=%d want %d", snap.Counters[statTCPProxyBytesUp], len(payload))
+	}
+	if want := int64(len("ECHO:") + len(payload)); snap.Counters[statTCPProxyBytesDown] != want {
+		t.Fatalf("proxy down bytes=%d want %d", snap.Counters[statTCPProxyBytesDown], want)
+	}
+	if snap.Counters[statTCPDirect] != 0 || snap.Counters[statTCPDirectBytesUp] != 0 {
+		t.Fatalf("direct counters must stay zero: %v", snap.Counters)
+	}
+	h := snap.Histograms[histTCPProxyDialSeconds]
+	if h.Count != 1 || h.SumSeconds <= 0 {
+		t.Fatalf("proxy dial histogram=%+v want count=1 sum>0", h)
+	}
+	if h.CumulativeCounts[len(h.CumulativeCounts)-1] != 1 {
+		t.Fatalf("proxy dial +Inf bucket=%v", h.CumulativeCounts)
+	}
+	if snap.Histograms[histTCPDirectDialSeconds].Count != 0 {
+		t.Fatalf("direct dial histogram must stay zero")
+	}
 }

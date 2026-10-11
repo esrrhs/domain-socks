@@ -377,7 +377,10 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 
 	if shouldProxy {
 		via = "socks"
+		// 成功与失败都进直方图：慢失败（超时）本身就是上游劣化信号
+		dialStart := time.Now()
 		up, err = socksConnect(proxy, domain, dstIP, dstPort, socksUser, socksPass)
+		st.observe(histTCPProxyDialSeconds, time.Since(dialStart))
 		if err != nil {
 			st.inc(statTCPSocksFail)
 			dialErr = err
@@ -387,7 +390,9 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 	} else {
 		// 直连直达
 		via = "direct"
+		dialStart := time.Now()
 		up, err = net.DialTimeout("tcp", target, 8*time.Second)
+		st.observe(histTCPDirectDialSeconds, time.Since(dialStart))
 		if err != nil {
 			st.inc(statTCPDirectFail)
 			dialErr = err

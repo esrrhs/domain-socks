@@ -47,7 +47,68 @@ const (
 	statTCPDirectBytesDown = "tcp_direct_bytes_down"
 	statUDPBytesIn         = "udp_bytes_in"  // LAN 入站报文载荷字节
 	statUDPBytesOut        = "udp_bytes_out" // 回送 LAN 的报文载荷字节
+
+	// 延迟直方图（固定桶，单位秒；observe 传拨号耗时，成功/失败都记）
+	histTCPProxyDialSeconds  = "tcp_proxy_dial_seconds"  // SOCKS5 拨号+协商+CONNECT 总耗时
+	histTCPDirectDialSeconds = "tcp_direct_dial_seconds" // 直连 net.Dial 耗时
 )
+
+// dialBuckets 覆盖拨号延迟的关心区间：局域网 SOCKS5 通常 <10ms，
+// 经公网上游劣化时落在 100ms~2s，8s/12s 超时的失败落入 +Inf 前的末档。
+var dialBuckets = []float64{
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2, 5, 10,
+}
+
+// histogram 是固定上界延迟分布（零依赖；观测热路径只有一次原子 Add）。
+// counts 长度为 len(buckets)+1，最后一个是 +Inf 桶；sumMicros 用整数
+// 微秒累加，避免 float 原子操作。buckets 构造后不可变，可跨实例共享。
+type histogram struct {
+	buckets   []float64
+	counts    []atomic.Int64
+	sumMicros atomic.Int64
+}
+
+func newHistogram(buckets []float64) *histogram {
+	return &histogram{buckets: buckets, counts: make([]atomic.Int64, len(buckets)+1)}
+}
+
+// observe 记录一次耗时。nil 接收者与负值均安全忽略。
+// 等上界归属：v 恰好等于桶边界时计入该桶（Prometheus le 语义）。
+func (h *histogram) observe(d time.Duration) {
+	if h == nil || d < 0 {
+		return
+	}
+	h.sumMicros.Add(d.Microseconds())
+	i := sort.SearchFloat64s(h.buckets, d.Seconds())
+	h.counts[i].Add(1)
+}
+
+type histogramJSON struct {
+	// BucketsLE 是有限桶上界（秒）；CumulativeCounts 比它多一个尾元素，
+	// 对应 le=+Inf（即 count）。刻意不在 JSON 中输出 +Inf（非法 JSON 数值）。
+	BucketsLE        []float64 `json:"buckets_le_seconds"`
+	CumulativeCounts []int64   `json:"cumulative_counts"`
+	Count            int64     `json:"count"`
+	SumSeconds       float64   `json:"sum_seconds"`
+}
+
+func (h *histogram) snapshot() histogramJSON {
+	cum := make([]int64, len(h.counts))
+	var total int64
+	for i := range h.counts {
+		total += h.counts[i].Load()
+		cum[i] = total
+	}
+	bounds := make([]float64, len(h.buckets))
+	copy(bounds, h.buckets)
+	return histogramJSON{
+		BucketsLE:        bounds,
+		CumulativeCounts: cum,
+		Count:            total,
+		SumSeconds:       float64(h.sumMicros.Load()) / 1e6,
+	}
+}
 
 // stats 持有进程级数据面计数器。所有 inc 方法对 nil 接收者安全，
 // 使未启用统计的构造路径（旧测试）无需改动。
@@ -60,6 +121,8 @@ type stats struct {
 
 	mu     sync.Mutex
 	gauges map[string]func() int64
+
+	histograms map[string]*histogram
 }
 
 func newStats() *stats {
@@ -76,13 +139,16 @@ func newStats() *stats {
 		statUDPBytesIn, statUDPBytesOut,
 	}
 	s := &stats{
-		start:    time.Now(),
-		counters: make(map[string]*atomic.Int64, len(keys)),
-		gauges:   make(map[string]func() int64),
+		start:      time.Now(),
+		counters:   make(map[string]*atomic.Int64, len(keys)),
+		gauges:     make(map[string]func() int64),
+		histograms: make(map[string]*histogram, 2),
 	}
 	for _, k := range keys {
 		s.counters[k] = new(atomic.Int64)
 	}
+	s.histograms[histTCPProxyDialSeconds] = newHistogram(dialBuckets)
+	s.histograms[histTCPDirectDialSeconds] = newHistogram(dialBuckets)
 	// 内部 gauge 直接注册
 	s.gauges["tcp_active"] = s.tcpActive.Load
 	return s
@@ -119,6 +185,16 @@ func (s *stats) add(key string, n int64) {
 	}
 }
 
+// observe 向命名直方图记录一次耗时（nil stats 安全）。
+func (s *stats) observe(key string, d time.Duration) {
+	if s == nil {
+		return
+	}
+	if h := s.histograms[key]; h != nil {
+		h.observe(d)
+	}
+}
+
 // registerGauges 注册瞬时值采集函数（如活跃 flow 数、association 在线状态）
 func (s *stats) registerGauges(m map[string]func() int64) {
 	if s == nil {
@@ -133,10 +209,11 @@ func (s *stats) registerGauges(m map[string]func() int64) {
 
 // statsJSON 是 /json 的稳定输出结构
 type statsJSON struct {
-	UptimeSeconds int64            `json:"uptime_seconds"`
-	Goroutines    int              `json:"goroutines"`
-	Counters      map[string]int64 `json:"counters"`
-	Gauges        map[string]int64 `json:"gauges"`
+	UptimeSeconds int64                    `json:"uptime_seconds"`
+	Goroutines    int                      `json:"goroutines"`
+	Counters      map[string]int64         `json:"counters"`
+	Gauges        map[string]int64         `json:"gauges"`
+	Histograms    map[string]histogramJSON `json:"histograms"`
 }
 
 func (s *stats) snapshot() statsJSON {
@@ -152,11 +229,16 @@ func (s *stats) snapshot() statsJSON {
 		}
 		s.mu.Unlock()
 	}
+	hists := make(map[string]histogramJSON, len(s.histograms))
+	for k, h := range s.histograms {
+		hists[k] = h.snapshot()
+	}
 	return statsJSON{
 		UptimeSeconds: int64(time.Since(s.start).Seconds()),
 		Goroutines:    runtime.NumGoroutine(),
 		Counters:      counters,
 		Gauges:        gauges,
+		Histograms:    hists,
 	}
 }
 
@@ -174,10 +256,21 @@ func (s *stats) renderText() string {
 			out += fmt.Sprintf("  %-22s %d\n", k, snap.Gauges[k])
 		}
 	}
+	if len(snap.Histograms) > 0 {
+		out += "histograms:\n"
+		for _, k := range sortedKeys(snap.Histograms) {
+			h := snap.Histograms[k]
+			out += fmt.Sprintf("  %s: count=%d sum=%.3fs\n", k, h.Count, h.SumSeconds)
+			for i, le := range h.BucketsLE {
+				out += fmt.Sprintf("    le=%-8g %d\n", le, h.CumulativeCounts[i])
+			}
+			out += fmt.Sprintf("    le=%-8s %d\n", "+Inf", h.CumulativeCounts[len(h.CumulativeCounts)-1])
+		}
+	}
 	return out
 }
 
-func sortedKeys(m map[string]int64) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

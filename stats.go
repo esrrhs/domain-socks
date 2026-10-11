@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,6 +124,7 @@ type stats struct {
 	gauges map[string]func() int64
 
 	histograms map[string]*histogram
+	conns      *connTracker
 }
 
 func newStats() *stats {
@@ -143,6 +145,7 @@ func newStats() *stats {
 		counters:   make(map[string]*atomic.Int64, len(keys)),
 		gauges:     make(map[string]func() int64),
 		histograms: make(map[string]*histogram, 2),
+		conns:      newConnTracker(),
 	}
 	for _, k := range keys {
 		s.counters[k] = new(atomic.Int64)
@@ -193,6 +196,111 @@ func (s *stats) observe(key string, d time.Duration) {
 	if h := s.histograms[key]; h != nil {
 		h.observe(d)
 	}
+}
+
+// connInfo 是一条存活中的透明 TCP 连接的实时视图（GET /conns）。
+// 注册时路由（via）已决定，state 在拨号成功后由 dial 切到 forward。
+type connInfo struct {
+	start  time.Time
+	client string
+	target string
+	via    string // socks / direct
+	up     *atomic.Int64
+	down   *atomic.Int64
+
+	mu    sync.Mutex
+	state string // "dial" | "forward"
+}
+
+func (i *connInfo) setState(state string) {
+	if i == nil {
+		return
+	}
+	i.mu.Lock()
+	i.state = state
+	i.mu.Unlock()
+}
+
+type connRow struct {
+	age            time.Duration
+	client, target string
+	via, state     string
+	up, down       int64
+}
+
+// connTracker 是存活连接集合。每连接仅 add/remove 两次短临界区，
+// 快照按 age 降序拷贝输出，遍历期间不阻塞数据面写字节。
+type connTracker struct {
+	mu    sync.Mutex
+	conns map[*connInfo]struct{}
+}
+
+func newConnTracker() *connTracker {
+	return &connTracker{conns: make(map[*connInfo]struct{})}
+}
+
+func (t *connTracker) add(i *connInfo) func() {
+	t.mu.Lock()
+	t.conns[i] = struct{}{}
+	t.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			delete(t.conns, i)
+			t.mu.Unlock()
+		})
+	}
+}
+
+// trackConn 登记一条连接（dial 状态），返回信息体与幂等注销函数。
+// nil 接收者安全，使未启用统计的构造路径无需判空。
+func (s *stats) trackConn(client, target, via string, up, down *atomic.Int64) (*connInfo, func()) {
+	if s == nil || s.conns == nil {
+		return nil, func() {}
+	}
+	info := &connInfo{
+		start: time.Now(), client: client, target: target, via: via,
+		up: up, down: down, state: "dial",
+	}
+	return info, s.conns.add(info)
+}
+
+func (t *connTracker) rows(now time.Time) []connRow {
+	t.mu.Lock()
+	rows := make([]connRow, 0, len(t.conns))
+	for i := range t.conns {
+		i.mu.Lock()
+		state := i.state
+		i.mu.Unlock()
+		rows = append(rows, connRow{
+			age: now.Sub(i.start), client: i.client, target: i.target,
+			via: i.via, state: state, up: i.up.Load(), down: i.down.Load(),
+		})
+	}
+	t.mu.Unlock()
+	sort.Slice(rows, func(a, b int) bool { return rows[a].age > rows[b].age })
+	return rows
+}
+
+// renderConns 输出 curl 友好的等宽表格；无连接时给明确提示。
+func (s *stats) renderConns(now time.Time) string {
+	if s == nil || s.conns == nil {
+		return "no active connections\n"
+	}
+	rows := s.conns.rows(now)
+	if len(rows) == 0 {
+		return "no active connections\n"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-9s %-7s %-8s %-22s %-30s %9s %9s\n",
+		"AGE", "VIA", "STATE", "CLIENT", "TARGET", "UP", "DOWN")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%-9s %-7s %-8s %-22s %-30s %9s %9s\n",
+			r.age.Round(time.Millisecond).String(), r.via, r.state,
+			r.client, r.target, humanBytes(r.up), humanBytes(r.down))
+	}
+	return b.String()
 }
 
 // registerGauges 注册瞬时值采集函数（如活跃 flow 数、association 在线状态）
@@ -346,6 +454,12 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 		}
 		_, _ = fmt.Fprintln(w, "ready")
 	})
+	// /conns：存活透明连接实时视图（拨号卡死/长连接排障），不缓存
+	mux.HandleFunc("/conns", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprint(w, s.renderConns(time.Now()))
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -357,6 +471,6 @@ func startStatsServer(addr string, s *stats, readyCheck func() error) *http.Serv
 			log.Printf("stats server: %v", err)
 		}
 	}()
-	log.Printf("stats server listening on %s (GET / /json /healthz /readyz)", ln.Addr())
+	log.Printf("stats server listening on %s (GET / /json /healthz /readyz /conns)", ln.Addr())
 	return srv
 }

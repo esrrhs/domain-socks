@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -430,5 +431,102 @@ func TestHandleConnProxyDialHistogram(t *testing.T) {
 	}
 	if snap.Histograms[histTCPDirectDialSeconds].Count != 0 {
 		t.Fatalf("direct dial histogram must stay zero")
+	}
+}
+
+// TestHandleConnActiveConnsView 验证存活连接实时视图：转发进行中的
+// 连接必须出现在 renderConns（forward 状态、实时字节），结束后消失。
+func TestHandleConnActiveConnsView(t *testing.T) {
+	gotData := make(chan struct{}, 1)
+	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		head := make([]byte, 256)
+		n, _ := c.Read(head)
+		if n > 0 {
+			gotData <- struct{}{}
+		}
+		rest, _ := io.ReadAll(c) // 阻塞到客户端 CloseWrite
+		_, _ = c.Write(append(append([]byte("GOT:"), head[:n]...), rest...))
+	}()
+	upPort := upLn.Addr().(*net.TCPAddr).Port
+	upTarget := fmt.Sprintf("127.0.0.1:%d", upPort)
+
+	frontLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frontLn.Close()
+	res := &stubExchangeResolver{proxyDomains: map[string]bool{}}
+	st := newStats()
+	dstOf := func(net.Conn) (net.IP, int, error) {
+		return net.ParseIP("127.0.0.1"), upPort, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		c, err := frontLn.Accept()
+		if err != nil {
+			t.Errorf("front accept: %v", err)
+			close(done)
+			return
+		}
+		handleConn(c, res, "127.0.0.1:0", "", "", dstOf, st, false)
+		close(done)
+	}()
+
+	cc, err := net.DialTimeout("tcp", frontLn.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "HOLD-DATA"
+	if _, err := cc.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gotData:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received payload")
+	}
+
+	// 转发中：轮询实时视图（给 setState/prefix 重放一点调度余量）
+	deadline := time.Now().Add(2 * time.Second)
+	var view string
+	for time.Now().Before(deadline) {
+		view = st.renderConns(time.Now())
+		if strings.Contains(view, upTarget) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, want := range []string{upTarget, "direct", "forward", humanBytes(int64(len(payload)))} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("active conn view missing %q:\n%s", want, view)
+		}
+	}
+
+	// 放行结束连接，视图必须清空
+	if err := cc.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := io.ReadAll(cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "GOT:" + payload; string(reply) != want {
+		t.Fatalf("reply=%q want %q", reply, want)
+	}
+	_ = cc.Close()
+	<-done
+
+	if got := st.renderConns(time.Now()); !strings.Contains(got, "no active connections") {
+		t.Fatalf("view after close must be empty:\n%s", got)
 	}
 }

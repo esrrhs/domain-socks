@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -259,16 +260,17 @@ func localDst(c net.Conn) (net.IP, int, error) {
 	return canonicalIP(ta.IP), ta.Port, nil
 }
 
-// countingConn 包装 net.Conn，累计 Write 成功字节数。每个连接使用独立的
-// *int64，且两个方向各由一个固定 goroutine 写入，无需原子操作。
+// countingConn 包装 net.Conn，累计 Write 成功字节数。每连接使用独立
+// atomic.Int64：转发 goroutine 写入，/conns 快照可在连接存活期间并发读取。
+// io.Copy 每块（32KiB）仅一次原子 Add，开销可忽略。
 type countingConn struct {
 	net.Conn
-	n *int64
+	n *atomic.Int64
 }
 
 func (c countingConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
-	*c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
 
@@ -308,21 +310,23 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 		target  = "unknown"
 		via     string
 		dialErr error
-		upB     int64 // 客户端 -> 远端
-		downB   int64 // 远端 -> 客户端
+		upB     atomic.Int64 // 客户端 -> 远端
+		downB   atomic.Int64 // 远端 -> 客户端
 	)
-	// 统一的连接结束日志 + 字节汇总（defer 先于 c.Close() 执行）
+	// 统一的连接结束日志 + 字节汇总（defer 先于 c.Close() 执行；
+	// 此时双向 copy goroutine 已退出，Load 仅为与 /conns 读端统一口径）
 	defer func() {
+		up, down := upB.Load(), downB.Load()
 		if accessLog {
-			log.Print(formatConnLine(client, target, via, upB, downB, time.Since(start), dialErr))
+			log.Print(formatConnLine(client, target, via, up, down, time.Since(start), dialErr))
 		}
 		switch via {
 		case "socks":
-			st.add(statTCPProxyBytesUp, upB)
-			st.add(statTCPProxyBytesDown, downB)
+			st.add(statTCPProxyBytesUp, up)
+			st.add(statTCPProxyBytesDown, down)
 		case "direct":
-			st.add(statTCPDirectBytesUp, upB)
-			st.add(statTCPDirectBytesDown, downB)
+			st.add(statTCPDirectBytesUp, up)
+			st.add(statTCPDirectBytesDown, down)
 		}
 	}()
 
@@ -375,6 +379,21 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 
 	var up net.Conn
 
+	// 展示用 target 提前换成嗅探/还原到的域名；直连拨号仍用原始 ip:port，
+	// 行为不变（经 SOCKS 的连接本就单独传 domain）。
+	dialTarget := target
+	if domain != "" {
+		target = net.JoinHostPort(domain, fmt.Sprintf("%d", dstPort))
+	}
+	dialVia := "direct"
+	if shouldProxy {
+		dialVia = "socks"
+	}
+	// 登记到 GET /conns：拨号阶段即可见（卡住的拨号是首要排障对象），
+	// 连接结束（含拨号失败/ dst 反查失败之后的各 return）统一注销。
+	ci, unregisterConn := st.trackConn(client, target, dialVia, &upB, &downB)
+	defer unregisterConn()
+
 	if shouldProxy {
 		via = "socks"
 		// 成功与失败都进直方图：慢失败（超时）本身就是上游劣化信号
@@ -391,7 +410,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 		// 直连直达
 		via = "direct"
 		dialStart := time.Now()
-		up, err = net.DialTimeout("tcp", target, 8*time.Second)
+		up, err = net.DialTimeout("tcp", dialTarget, 8*time.Second)
 		st.observe(histTCPDirectDialSeconds, time.Since(dialStart))
 		if err != nil {
 			st.inc(statTCPDirectFail)
@@ -401,11 +420,7 @@ func handleConn(c net.Conn, resolver ghdns.Resolver, proxy string, socksUser str
 		st.inc(statTCPDirect)
 	}
 	defer up.Close()
-
-	// 嗅探到域名后，访问日志用域名而非 IP/Fake-IP
-	if domain != "" {
-		target = net.JoinHostPort(domain, fmt.Sprintf("%d", dstPort))
-	}
+	ci.setState("forward")
 
 	upConn := countingConn{Conn: up, n: &upB}
 	downConn := countingConn{Conn: c, n: &downB}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ type bufConn struct {
 func (b *bufConn) Write(p []byte) (int, error) { return b.buf.Write(p) }
 
 func TestCountingConn(t *testing.T) {
-	var n int64
+	var n atomic.Int64
 	raw := &bufConn{}
 	c := countingConn{Conn: raw, n: &n}
 
@@ -85,8 +86,8 @@ func TestCountingConn(t *testing.T) {
 	if k, err := c.Write([]byte("pong")); err != nil || k != 4 {
 		t.Fatalf("second write: k=%d err=%v", k, err)
 	}
-	if n != 8 || raw.buf.String() != "pingpong" {
-		t.Fatalf("counted=%d underlying=%q", n, raw.buf.String())
+	if n.Load() != 8 || raw.buf.String() != "pingpong" {
+		t.Fatalf("counted=%d underlying=%q", n.Load(), raw.buf.String())
 	}
 }
 
@@ -635,5 +636,108 @@ func TestHistogramExposedInSnapshots(t *testing.T) {
 		!strings.Contains(text, "le=") ||
 		!strings.Contains(text, "+Inf") {
 		t.Fatalf("text snapshot missing histogram section:\n%s", text)
+	}
+}
+
+func TestConnTrackerLifecycle(t *testing.T) {
+	s := newStats()
+	var up1, down1, up2, down2 atomic.Int64
+	up1.Store(100)
+	down1.Store(200)
+
+	i1, unreg1 := s.trackConn("192.168.1.5:5000", "www.example.com:443", "socks", &up1, &down1)
+	i2, unreg2 := s.trackConn("192.168.1.6:5001", "10.1.2.3:80", "direct", &up2, &down2)
+	if i1 == nil || i2 == nil {
+		t.Fatal("trackConn must return info + unregister")
+	}
+
+	rows := s.conns.rows(time.Now())
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	// 注册即 dial 状态
+	var r1 connRow
+	for _, r := range rows {
+		if r.target == "www.example.com:443" {
+			r1 = r
+		}
+	}
+	if r1.client != "192.168.1.5:5000" || r1.via != "socks" || r1.state != "dial" ||
+		r1.up != 100 || r1.down != 200 || r1.age <= 0 {
+		t.Fatalf("tracked row mismatch: %+v", r1)
+	}
+
+	// 拨号完成切 forward；字节热更新无需重新注册
+	i1.setState("forward")
+	up1.Add(50)
+	rows = s.conns.rows(time.Now())
+	for _, r := range rows {
+		if r.target == "www.example.com:443" {
+			if r.state != "forward" || r.up != 150 {
+				t.Fatalf("forward row mismatch: %+v", r)
+			}
+		}
+	}
+
+	// 注销幂等
+	unreg1()
+	unreg1()
+	if len(s.conns.rows(time.Now())) != 1 {
+		t.Fatal("idempotent unregister must leave exactly one conn")
+	}
+	unreg2()
+	if rows := s.conns.rows(time.Now()); len(rows) != 0 {
+		t.Fatalf("all unregistered: rows=%d want 0", len(rows))
+	}
+
+	// nil stats / nil info 全部安全
+	var nilS *stats
+	if ni, fn := nilS.trackConn("c", "t", "socks", &up1, &down1); ni != nil {
+		t.Fatal("nil stats trackConn must return nil info")
+	} else {
+		fn() // 不得 panic
+	}
+	var nilInfo *connInfo
+	nilInfo.setState("forward") // 不得 panic
+}
+
+func TestConnsHTTPEndpoint(t *testing.T) {
+	s := newStats()
+	srv := startStatsServer("127.0.0.1:0", s, func() error { return nil })
+	if srv == nil {
+		t.Fatal("stats server failed")
+	}
+	defer srv.Close()
+	base := "http://" + srv.Addr
+
+	// 空集合
+	resp, err := http.Get(base + "/conns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "no active connections") {
+		t.Fatalf("empty /conns: status=%d body=%q", resp.StatusCode, body)
+	}
+
+	// 存活连接出现在表格中
+	var up, down atomic.Int64
+	up.Store(2048)
+	down.Store(1 << 20)
+	info, unreg := s.trackConn("192.168.1.5:54321", "www.google.com:443", "socks", &up, &down)
+	info.setState("forward")
+	defer unreg()
+
+	resp2, err := http.Get(base + "/conns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	for _, want := range []string{"www.google.com:443", "192.168.1.5:54321", "socks", "forward", "2.0KiB", "1.00MiB", "AGE"} {
+		if !strings.Contains(string(tbl), want) {
+			t.Fatalf("/conns table missing %q:\n%s", want, tbl)
+		}
 	}
 }

@@ -152,3 +152,72 @@ func TestRotatingWriterZeroBackups(t *testing.T) {
 		t.Fatal("no backup files allowed with backups=0")
 	}
 }
+
+// TestRotatingWriterReopen 模拟外部 logrotate：旧文件被 rename 后，
+// 不 reopen 写入仍落旧 inode；Reopen 后必须写到同路径的新文件，
+// 旧文件保留被切走时的内容（postrotate 可压缩归档）。
+func TestRotatingWriterReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ds.log")
+	rotated := path + ".1"
+
+	w, err := newRotatingWriter(path, 1024, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("before-rotation\n"))
+
+	// logrotate 的 rename 动作（不发 copytruncate）
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+
+	// reopen 前：写入仍跟随旧 fd（被 rename 的文件）
+	_, _ = w.Write([]byte("still-old-inode\n"))
+	if _, ok := readFile(t, path); ok {
+		t.Fatal("path must not exist before reopen: writer still holds the renamed inode")
+	}
+	old, _ := readFile(t, rotated)
+	if !strings.Contains(old, "still-old-inode") {
+		t.Fatalf("renamed file should keep pre-reopen writes:\n%s", old)
+	}
+
+	if err := w.Reopen(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("after-reopen\n"))
+	_ = w.Close()
+
+	cur, ok := readFile(t, path)
+	if !ok || !strings.Contains(cur, "after-reopen") {
+		t.Fatalf("post-reopen write must land at the path again, ok=%v:\n%s", ok, cur)
+	}
+	if strings.Contains(cur, "before-rotation") {
+		t.Fatalf("new file must not contain pre-rotation bytes:\n%s", cur)
+	}
+	// 被切走的旧文件内容未被破坏
+	old2, _ := readFile(t, rotated)
+	if !strings.Contains(old2, "before-rotation") || !strings.Contains(old2, "still-old-inode") {
+		t.Fatalf("rotated file contents changed:\n%s", old2)
+	}
+}
+
+// TestRotatingWriterReopenFailure reopen 目标目录消失：返回错误且后续
+// 写入静默丢弃（只剩 stderr），不 panic、不影响调用方。
+func TestRotatingWriterReopenFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ds.log")
+	w, err := newRotatingWriter(path, 1024, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Reopen(); err == nil {
+		t.Fatal("reopen into a removed dir must fail")
+	}
+	if n, err := w.Write([]byte("into-the-void\n")); n != len("into-the-void\n") || err != nil {
+		t.Fatalf("write after failed reopen must be swallowed, got n=%d err=%v", n, err)
+	}
+}

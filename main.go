@@ -51,6 +51,7 @@ func main() {
 
 	// 文件日志尽早启用：后续参数校验的 log.Fatal 也要落进文件。
 	// 打开失败只告警并退回 stderr-only，与 stats 绑定失败同策略。
+	var logWriter *rotatingWriter // 非 nil 时供 SIGHUP reopen
 	if *logFile != "" {
 		if *logMaxMB < 1 {
 			log.Fatal("-log-max-mb must be >= 1")
@@ -62,6 +63,7 @@ func main() {
 		if err != nil {
 			log.Printf("warning: open log file %s: %v (continuing with stderr only)", *logFile, err)
 		} else {
+			logWriter = lw
 			log.SetOutput(io.MultiWriter(os.Stderr, lw))
 			defer lw.Close()
 			log.Printf("file logging enabled: %s (rotate at %dMiB, keep %d backups)", *logFile, *logMaxMB, *logBackups)
@@ -110,6 +112,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("init resolver failed: %v", err)
 	}
+
+	// SIGHUP 热重载：重新打开日志文件（外部 logrotate）并全量重载
+	// 分流域名表/GeoIP、清 DNS 缓存；不重建监听、不中断在途连接。
+	hupCh := notifyReload()
+	defer stopReload(hupCh)
+	go func() {
+		for range hupCh {
+			summary, rerr := reloadConfig(logWriter, resolver,
+				*directDomainsFile, *proxyDomainsFile, *geoipFile)
+			if rerr != nil {
+				log.Printf("SIGHUP reload finished with errors: %s (%v)", summary, rerr)
+				continue
+			}
+			log.Printf("SIGHUP %s", summary)
+		}
+	}()
 
 	// 2. 包装 Resolver：过滤代理域名的 AAAA，防止客户端走真实 IPv6 绕过透明
 	// 代理。始终包装一层以便统计 DNS 平面指标；过滤与否由 enabled 控制。

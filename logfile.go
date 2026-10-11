@@ -93,3 +93,28 @@ func (w *rotatingWriter) Close() error {
 	w.f = nil
 	return err
 }
+
+// Reopen 关闭当前文件句柄并以 append 模式重新打开同一路径：配合外部
+// logrotate（重命名旧文件后发 SIGHUP）切换到新 inode；自轮转不依赖它。
+// 重新打开失败时文件句柄置空（后续写仅走 stderr，不影响数据面），
+// 但仍把错误返回给调用方记录。
+func (w *rotatingWriter) Reopen() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		w.size = 0
+		return err
+	}
+	w.f = f
+	if fi, err := f.Stat(); err == nil {
+		w.size = fi.Size()
+	} else {
+		w.size = 0
+	}
+	return nil
+}

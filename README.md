@@ -465,3 +465,11 @@ On `SIGINT`/`SIGTERM` (i.e. `/etc/init.d/domain-socks stop|restart`) the daemon 
 2. remaining client connections are then **force-closed**, which unblocks their `io.Copy` loops and runs the close-time defers; the UDP gateway's close path flushes idle-flow stats at the same point.
 
 The whole shutdown is bounded by a **3s budget**, well inside procd's default 5s `term_timeout` (so it never relies on `SIGKILL`). A graceful stop — even one that had to abandon a connection stuck in a context-less dial — exits with code 0 so procd does not count it as a crash. Sending `SIGTERM`/`SIGINT` a **second time** skips the drain and exits immediately with code 1; every shutdown step is logged to stderr and the rotating log file.
+
+`SIGHUP` (Unix; `kill -HUP $(pidof domain-socks)`) performs an **online reload without dropping connections**: it reopens the log file (point it at the new inode after an external logrotate renames the old one), fully re-reads the `-direct-domains-file`/`-proxy-domains-file` lists (domains removed from the file actually stop matching — the tables are reset and reloaded, built-in defaults are preserved), reopens the GeoIP database when configured, and flushes the DNS cache so new routing rules apply to the next query instead of waiting for TTL expiry. A bad file is reported in the log but does not abort the rest of the reload; on Windows `SIGHUP` does not exist, so restart the service to apply changes.
+
+```sh
+# after editing the domain list or rotating the log:
+kill -HUP $(pidof domain-socks)
+# log: SIGHUP reload complete: direct domains=128, proxy domains=34
+```

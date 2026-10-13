@@ -694,3 +694,30 @@ func TestUDPFlowAggregationFlush(t *testing.T) {
 		t.Fatalf("flow histogram double-observed: count=%d want 2", h.Count)
 	}
 }
+
+// TestUDPFwdFailLogRateLimit 验证转发失败日志的限频窗口：
+// 首条必报、窗口内后续抑制、过期后恢复。代理持续不可用时入站
+// 包每秒可达数十个，不限频会刷爆路由器日志。
+func TestUDPFwdFailLogRateLimit(t *testing.T) {
+	gw := newUDPGateway(nil, "127.0.0.1:1", "", "")
+	defer gw.Close()
+
+	// 零值 lastFwdFailLog（year 1）保证首条一定放行
+	if !gw.shouldLogFwdFail() {
+		t.Fatal("first forward failure must be logged")
+	}
+	if gw.shouldLogFwdFail() {
+		t.Fatal("second failure inside the window must be suppressed")
+	}
+
+	// 把上次记录回拨到窗口之外：放行必须恢复
+	gw.mu.Lock()
+	gw.lastFwdFailLog = time.Now().Add(-udpFwdFailLogInterval - time.Millisecond)
+	gw.mu.Unlock()
+	if !gw.shouldLogFwdFail() {
+		t.Fatal("logging must resume once the window elapsed")
+	}
+	if gw.shouldLogFwdFail() {
+		t.Fatal("freshly logged failure must open a new window")
+	}
+}

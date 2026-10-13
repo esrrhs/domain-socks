@@ -87,12 +87,14 @@ var connBuckets = []float64{
 }
 
 // histogram 是固定上界延迟分布（零依赖；观测热路径只有一次原子 Add）。
-// counts 长度为 len(buckets)+1，最后一个是 +Inf 桶；sumMicros 用整数
-// 微秒累加，避免 float 原子操作。buckets 构造后不可变，可跨实例共享。
+// counts 长度为 len(buckets)+1，最后一个是 +Inf 桶；sumNanos 用整数
+// 纳秒累加，避免 float 原子操作。纳秒级精度不可再降：内存态上游（测试
+// stub、本地回环）往返只有几百纳秒，微秒取整会把它们全部记成 0，
+// 使 sum 与 count 失去比例关系。buckets 构造后不可变，可跨实例共享。
 type histogram struct {
-	buckets   []float64
-	counts    []atomic.Int64
-	sumMicros atomic.Int64
+	buckets  []float64
+	counts   []atomic.Int64
+	sumNanos atomic.Int64
 }
 
 func newHistogram(buckets []float64) *histogram {
@@ -105,7 +107,7 @@ func (h *histogram) observe(d time.Duration) {
 	if h == nil || d < 0 {
 		return
 	}
-	h.sumMicros.Add(d.Microseconds())
+	h.sumNanos.Add(int64(d))
 	i := sort.SearchFloat64s(h.buckets, d.Seconds())
 	h.counts[i].Add(1)
 }
@@ -132,7 +134,7 @@ func (h *histogram) snapshot() histogramJSON {
 		BucketsLE:        bounds,
 		CumulativeCounts: cum,
 		Count:            total,
-		SumSeconds:       float64(h.sumMicros.Load()) / 1e6,
+		SumSeconds:       float64(h.sumNanos.Load()) / 1e9,
 	}
 }
 

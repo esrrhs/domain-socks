@@ -19,6 +19,9 @@ A lightweight Fake-IP transparent proxy client designed for OpenWrt and Linux ro
 - **Captive Portal Bypass**: Responds HTTP 204 directly for `/generate_204` connectivity check probes.
 - **SOCKS5 Upstream**: Forwards TCP connections with domain names (`ATYP=0x03`), letting the remote SOCKS5 server handle external resolution and routing.
 - **Optional UDP Relay** (`-udplisten` / `-udp-tproxy`): Transparently intercepted UDP is relayed via RFC 1928 UDP ASSOCIATE (one shared association, domain-mode `ATYP=0x03` for Fake-IP targets, `ATYP=0x04` for literal IPv6 proxy targets) or sent direct (separate v4/v6 sockets); control-channel loss triggers automatic re-association. `REDIRECT` mode is IPv4-only; `TPROXY` mode is dual-stack. Disabled by default.
+- **Remote DNS leaves via the proxy**: The few queries that genuinely need a remote resolver (non-`A`/`AAAA` types, and `AAAA` with `-disable-aaaa=false`) go out through the SOCKS5 upstream instead of plaintext DoH — see [Remote DNS](#remote-dns-the-narrow-path-that-really-leaves-via-the-proxy).
+- **Config File & Online Reload**: A `key=value` config file (`-config`) with command line > file > built-in defaults and fail-fast validation; SIGHUP re-reads it and applies upstream/auth, `access-log`, `disable-aaaa` and rule-file paths online, while listener/log/DNS changes are *detected and logged* as needing a restart instead of being ignored.
+- **Runtime Observability**: Read-only metrics endpoint (human text, JSON, and Prometheus exposition) with per-route byte counters, seven latency histograms, a live connection table, per-domain/per-client bandwidth leaderboards, `/healthz` and `/readyz`; opt-in pprof; and a VCS-stamped build version (`domain-socks -version`, also logged at startup).
 - **Graceful Shutdown**: Drains in-flight connections (up to 3s) on SIGINT/SIGTERM.
 
 ## Usage
@@ -83,7 +86,7 @@ Fake-IP short-circuits almost everything: an `A` query for anything that is not 
 
 One limitation: DoH-over-SOCKS5 in the resolver carries no username/password, so when `-socks-user`/`-socks-pass` are configured the remote DoH upstreams are **disabled at startup** (logged as `remote DoH disabled: upstream socks requires auth…`) and those rare queries fall back to the domestic resolvers instead of being sent unauthenticated — better than a doomed or leaking request. The startup config line reports which mode you are in (`remote-doh=via-socks` or `remote-doh=off`); changing `-socks` on SIGHUP re-points the DoH proxy too, while switching an upstream **to** an authenticated one keeps the previous DoH proxy until you restart (also logged).
 
-Quick check on the router:
+### Quick check on the router
 
 ```bash
 curl -s http://127.0.0.1:18080/ | grep -E 'socks_fail|assoc_|forward_fail|dns_|bytes'

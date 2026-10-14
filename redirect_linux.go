@@ -8,6 +8,8 @@ import (
 	"net"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func originalDst(conn net.Conn) (net.IP, int, error) {
@@ -37,6 +39,9 @@ func originalDst(conn net.Conn) (net.IP, int, error) {
 // sockOrigDst 通过 SO_ORIGINAL_DST 从 conntrack 读取 REDIRECT/DNAT 前的
 // 原始目标地址。TCP 监听 socket 与 UDP "connect 到客户端"的 probe socket
 // 共用本实现。
+// 注意：SO_ORIGINAL_DST 的数值各 Linux 架构一致（asm-generic 0x50），
+// 但经 unix.SO_ORIGINAL_DST 引用而非硬编码魔数——OpenWrt 目标含
+// mipsel（Newifi3/MT7621），常量引用让架构分歧在编译期暴露。
 func sockOrigDst(fd uintptr) (net.IP, int, error) {
 	var buf [128]byte
 	size := uint32(len(buf))
@@ -44,7 +49,7 @@ func sockOrigDst(fd uintptr) (net.IP, int, error) {
 		syscall.SYS_GETSOCKOPT,
 		fd,
 		uintptr(syscall.IPPROTO_IP),
-		80, // SO_ORIGINAL_DST
+		uintptr(unix.SO_ORIGINAL_DST),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&size)),
 		0,

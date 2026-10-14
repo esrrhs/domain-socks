@@ -17,7 +17,9 @@ func TestExampleConfigFileValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	re := regexp.MustCompile(`flag\.(?:String|Bool|Int)\("([^"]+)"`)
+	// 选项定义在 defineFlags 里注册到传入的 FlagSet（flag.CommandLine
+	// 或取内置默认用的临时集），故这里按方法名匹配而不绑定接收者名。
+	re := regexp.MustCompile(`\.(?:String|Bool|Int)\("([^"]+)"`)
 	defined := map[string]bool{}
 	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
 		defined[m[1]] = true

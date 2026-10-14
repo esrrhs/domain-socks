@@ -20,6 +20,118 @@ import (
 	"github.com/miekg/dns"
 )
 
+// options 保存全部命令行选项的生效值。定义集中在 defineFlags，因此
+// 同一套定义可以在一个临时 FlagSet 上重跑一遍，取出不受配置文件影响
+// 的"纯内置默认"——SIGHUP 重读配置文件时用它做优先级回落，默认值
+// 不必在两处重复书写。
+type options struct {
+	socks, socksUser, socksPass         string
+	dns, listen                         string
+	directDNS                           string
+	directDomainsFile, proxyDomainsFile string
+	geoipFile                           string
+	disableAAAA                         bool
+	udpListen, tproxyListen, udpTProxy  string
+	statsAddr                           string
+	accessLog                           bool
+	logFile                             string
+	logMaxMB, logBackups                int
+	showVersion, pprofEnable            bool
+}
+
+// flagPtrs 是 defineFlags 注册的选项指针集合：flag.Parse 之后 deref
+// 出 options；同一套定义跑在一个从未 Parse 的临时 FlagSet 上，指针里
+// 装的就是纯内置默认值。
+type flagPtrs struct {
+	socks, socksUser, socksPass         *string
+	dns, listen                         *string
+	directDNS                           *string
+	directDomainsFile, proxyDomainsFile *string
+	geoipFile                           *string
+	disableAAAA                         *bool
+	udpListen, tproxyListen, udpTProxy  *string
+	statsAddr                           *string
+	accessLog                           *bool
+	logFile                             *string
+	logMaxMB, logBackups                *int
+	showVersion, pprofEnable            *bool
+}
+
+// defineFlags 在给定 FlagSet 上注册全部选项。cfg 提供配置文件注入的
+// 默认值（命令行显式传参由 flag 包覆盖），传空 config 即可得到内置默认。
+func defineFlags(fs *flag.FlagSet, cfg *config) *flagPtrs {
+	p := &flagPtrs{}
+	p.socks = fs.String("socks", cfg.String("socks", "192.168.1.101:1081"), "upstream socks5")
+	fs.String("config", "", "key=value config file supplying flag defaults (comments with #; command line overrides the file; this flag itself is command-line only)")
+	p.socksUser = fs.String("socks-user", cfg.String("socks-user", ""), "upstream socks5 username")
+	p.socksPass = fs.String("socks-pass", cfg.String("socks-pass", ""), "upstream socks5 password")
+	p.dns = fs.String("dns", cfg.String("dns", "[::]:1053"), "dns listen address; wildcard listens dual-stack (v4+v6) and falls back to v4-only if the kernel lacks IPv6")
+	p.listen = fs.String("listen", cfg.String("listen", "0.0.0.0:12345"), "transparent redirect listen")
+	p.directDNS = fs.String("direct-dns", cfg.String("direct-dns", "223.5.5.5:53,119.29.29.29:53"), "domestic upstream DNS servers (comma-separated)")
+	p.directDomainsFile = fs.String("direct-domains-file", cfg.String("direct-domains-file", ""), "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
+	p.proxyDomainsFile = fs.String("proxy-domains-file", cfg.String("proxy-domains-file", ""), "optional file containing extra proxy domains (e.g. dnsmasq format or line list)")
+	p.geoipFile = fs.String("geoip", cfg.String("geoip", ""), "optional GeoLite2-Country.mmdb path for IP-based CN split routing")
+	p.disableAAAA = fs.Bool("disable-aaaa", cfg.Bool("disable-aaaa", true), "answer AAAA queries of proxy domains with empty NOERROR to prevent IPv6 bypass leak")
+	p.udpListen = fs.String("udplisten", cfg.String("udplisten", ""), "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
+	p.tproxyListen = fs.String("tproxy", cfg.String("tproxy", ""), "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
+	p.udpTProxy = fs.String("udp-tproxy", cfg.String("udp-tproxy", ""), "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
+	p.statsAddr = fs.String("stats-addr", cfg.String("stats-addr", "127.0.0.1:18080"), "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
+	p.accessLog = fs.Bool("access-log", cfg.Bool("access-log", true), "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
+	p.logFile = fs.String("log-file", cfg.String("log-file", ""), "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
+	p.logMaxMB = fs.Int("log-max-mb", cfg.Int("log-max-mb", 1), "max size in MB of one log file before it is rotated to .1")
+	p.logBackups = fs.Int("log-backups", cfg.Int("log-backups", 3), "number of rotated backup files to keep (.1 newest .. .N oldest)")
+	p.showVersion = fs.Bool("version", cfg.Bool("version", false), "print the embedded build version (git commit) and exit")
+	p.pprofEnable = fs.Bool("pprof", cfg.Bool("pprof", false), "expose Go runtime pprof diagnostics at /debug/pprof/ on the stats address (goroutine stacks, heap, CPU profile; stats addr defaults to loopback)")
+	return p
+}
+
+// options 把指针集合解引用成一份普通取值快照。
+func (p *flagPtrs) options() *options {
+	return &options{
+		socks:             derefString(p.socks),
+		socksUser:         derefString(p.socksUser),
+		socksPass:         derefString(p.socksPass),
+		dns:               derefString(p.dns),
+		listen:            derefString(p.listen),
+		directDNS:         derefString(p.directDNS),
+		directDomainsFile: derefString(p.directDomainsFile),
+		proxyDomainsFile:  derefString(p.proxyDomainsFile),
+		geoipFile:         derefString(p.geoipFile),
+		disableAAAA:       derefBool(p.disableAAAA),
+		udpListen:         derefString(p.udpListen),
+		tproxyListen:      derefString(p.tproxyListen),
+		udpTProxy:         derefString(p.udpTProxy),
+		statsAddr:         derefString(p.statsAddr),
+		accessLog:         derefBool(p.accessLog),
+		logFile:           derefString(p.logFile),
+		logMaxMB:          derefInt(p.logMaxMB),
+		logBackups:        derefInt(p.logBackups),
+		showVersion:       derefBool(p.showVersion),
+		pprofEnable:       derefBool(p.pprofEnable),
+	}
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
+	}
+	return *p
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 func main() {
 	// 配置文件先行：文件值作为各 flag 的默认注入，命令行显式传参
 	// 由 flag 包覆盖 —— 优先级天然是 命令行 > 配置文件 > 内置默认。
@@ -28,28 +140,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	socks := flag.String("socks", cfgFile.String("socks", "192.168.1.101:1081"), "upstream socks5")
-	flag.String("config", "", "key=value config file supplying flag defaults (comments with #; command line overrides the file; this flag itself is command-line only)")
-	socksUser := flag.String("socks-user", cfgFile.String("socks-user", ""), "upstream socks5 username")
-	socksPass := flag.String("socks-pass", cfgFile.String("socks-pass", ""), "upstream socks5 password")
-	dnsAddr := flag.String("dns", cfgFile.String("dns", "[::]:1053"), "dns listen address; wildcard listens dual-stack (v4+v6) and falls back to v4-only if the kernel lacks IPv6")
-	listen := flag.String("listen", cfgFile.String("listen", "0.0.0.0:12345"), "transparent redirect listen")
-	directDNS := flag.String("direct-dns", cfgFile.String("direct-dns", "223.5.5.5:53,119.29.29.29:53"), "domestic upstream DNS servers (comma-separated)")
-	directDomainsFile := flag.String("direct-domains-file", cfgFile.String("direct-domains-file", ""), "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
-	proxyDomainsFile := flag.String("proxy-domains-file", cfgFile.String("proxy-domains-file", ""), "optional file containing extra proxy domains (e.g. dnsmasq format or line list)")
-	geoipFile := flag.String("geoip", cfgFile.String("geoip", ""), "optional GeoLite2-Country.mmdb path for IP-based CN split routing")
-	disableAAAA := flag.Bool("disable-aaaa", cfgFile.Bool("disable-aaaa", true), "answer AAAA queries of proxy domains with empty NOERROR to prevent IPv6 bypass leak")
-	udpListen := flag.String("udplisten", cfgFile.String("udplisten", ""), "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
-	tproxyListen := flag.String("tproxy", cfgFile.String("tproxy", ""), "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
-	udpTProxy := flag.String("udp-tproxy", cfgFile.String("udp-tproxy", ""), "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
-	statsAddr := flag.String("stats-addr", cfgFile.String("stats-addr", "127.0.0.1:18080"), "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
-	accessLog := flag.Bool("access-log", cfgFile.Bool("access-log", true), "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
-	logFile := flag.String("log-file", cfgFile.String("log-file", ""), "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
-	logMaxMB := flag.Int("log-max-mb", cfgFile.Int("log-max-mb", 1), "max size in MB of one log file before it is rotated to .1")
-	logBackups := flag.Int("log-backups", cfgFile.Int("log-backups", 3), "number of rotated backup files to keep (.1 newest .. .N oldest)")
-	showVersion := flag.Bool("version", cfgFile.Bool("version", false), "print the embedded build version (git commit) and exit")
-	pprofEnable := flag.Bool("pprof", cfgFile.Bool("pprof", false), "expose Go runtime pprof diagnostics at /debug/pprof/ on the stats address (goroutine stacks, heap, CPU profile; stats addr defaults to loopback)")
+	flagPtrs := defineFlags(flag.CommandLine, cfgFile)
 	flag.Parse()
+	opts := flagPtrs.options()
 
 	// 配置文件的键必须真实存在、值必须类型正确：路由器上一个拼写错误
 	// 就可能让 socks 上游静默回落到内置默认值，等于流量走错方向。
@@ -59,7 +152,7 @@ func main() {
 	}
 
 	// -version 只输出一行版本信息即退出，不初始化任何服务、不碰日志文件。
-	if *showVersion {
+	if opts.showVersion {
 		fmt.Println("domain-socks version " + readBuildInfo().versionString())
 		return
 	}
@@ -67,21 +160,21 @@ func main() {
 	// 文件日志尽早启用：后续参数校验的 log.Fatal 也要落进文件。
 	// 打开失败只告警并退回 stderr-only，与 stats 绑定失败同策略。
 	var logWriter *rotatingWriter // 非 nil 时供 SIGHUP reopen
-	if *logFile != "" {
-		if *logMaxMB < 1 {
+	if opts.logFile != "" {
+		if opts.logMaxMB < 1 {
 			log.Fatal("-log-max-mb must be >= 1")
 		}
-		if *logBackups < 0 {
+		if opts.logBackups < 0 {
 			log.Fatal("-log-backups must be >= 0")
 		}
-		lw, err := newRotatingWriter(*logFile, int64(*logMaxMB)*1024*1024, *logBackups)
+		lw, err := newRotatingWriter(opts.logFile, int64(opts.logMaxMB)*1024*1024, opts.logBackups)
 		if err != nil {
-			log.Printf("warning: open log file %s: %v (continuing with stderr only)", *logFile, err)
+			log.Printf("warning: open log file %s: %v (continuing with stderr only)", opts.logFile, err)
 		} else {
 			logWriter = lw
 			log.SetOutput(io.MultiWriter(os.Stderr, lw))
 			defer lw.Close()
-			log.Printf("file logging enabled: %s (rotate at %dMiB, keep %d backups)", *logFile, *logMaxMB, *logBackups)
+			log.Printf("file logging enabled: %s (rotate at %dMiB, keep %d backups)", opts.logFile, opts.logMaxMB, opts.logBackups)
 		}
 	}
 
@@ -91,23 +184,35 @@ func main() {
 	log.Printf("domain-socks version %s (go %s)", binInfo.versionString(),
 		nonEmpty(binInfo.goVersion, "unknown"))
 
+	// 命令行显式给出的键：优先级最高，SIGHUP 重读配置文件时不允许被
+	// 文件覆盖（改文件不该悄悄顶掉管理员在命令行上的决定）。
 	listenExplicitlySet := false
+	cmdline := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) {
+		cmdline[f.Name] = true
 		if f.Name == "listen" {
 			listenExplicitlySet = true
 		}
 	})
 	// 配置文件给出非空 listen 等同于显式指定（它已注入为 flag 默认值，
 	// flag.Visit 看不到），互斥校验必须一起算上。
-	if !listenExplicitlySet && cfgFile.Has("listen") && *listen != "" {
+	if !listenExplicitlySet && cfgFile.Has("listen") && opts.listen != "" {
 		listenExplicitlySet = true
 	}
-	if *tproxyListen != "" && listenExplicitlySet {
+	if opts.tproxyListen != "" && listenExplicitlySet {
 		log.Fatal("-tproxy is mutually exclusive with -listen (choose one TCP interception mode)")
 	}
-	if *udpTProxy != "" && *udpListen != "" {
+	if opts.udpTProxy != "" && opts.udpListen != "" {
 		log.Fatal("-udp-tproxy is mutually exclusive with -udplisten (choose one UDP interception mode)")
 	}
+
+	// 内置默认快照：同一套定义在空配置上跑一遍得到。SIGHUP 重读时
+	// "文件里删掉的键"据此回落到内置默认，与启动时行为一致。
+	builtin := defineFlags(flag.NewFlagSet("builtin-defaults", flag.ContinueOnError),
+		&config{vals: map[string]string{}}).options()
+	// 当前生效配置：热项（上游/认证/日志开关/规则文件路径）读它，
+	// 冷项（监听地址等）只在变更检测时比对。
+	rc := newRuntimeConf(newRuntimeOptions(opts))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -115,17 +220,17 @@ func main() {
 	// 1. 初始化 gohome DNS Resolver 配置
 	cfg := ghdns.DefaultConfig()
 	cfg.EnableFakeIP = true // 代理域名返回 Fake-IP；国内直连域名返回真实 IP
-	if *directDNS != "" {
-		cfg.DirectUpstreams = strings.Split(*directDNS, ",")
+	if opts.directDNS != "" {
+		cfg.DirectUpstreams = strings.Split(opts.directDNS, ",")
 	}
-	if *directDomainsFile != "" {
-		cfg.DirectDomainFiles = []string{*directDomainsFile}
+	if opts.directDomainsFile != "" {
+		cfg.DirectDomainFiles = []string{opts.directDomainsFile}
 	}
-	if *proxyDomainsFile != "" {
-		cfg.ProxyDomainFiles = []string{*proxyDomainsFile}
+	if opts.proxyDomainsFile != "" {
+		cfg.ProxyDomainFiles = []string{opts.proxyDomainsFile}
 	}
-	if *geoipFile != "" {
-		cfg.GeoIPFile = *geoipFile
+	if opts.geoipFile != "" {
+		cfg.GeoIPFile = opts.geoipFile
 	}
 
 	resolver, err := ghdns.NewResolver(cfg)
@@ -133,33 +238,18 @@ func main() {
 		log.Fatalf("init resolver failed: %v", err)
 	}
 
-	// SIGHUP 热重载：重新打开日志文件（外部 logrotate）并全量重载
-	// 分流域名表/GeoIP、清 DNS 缓存；不重建监听、不中断在途连接。
-	hupCh := notifyReload()
-	defer stopReload(hupCh)
-	go func() {
-		for range hupCh {
-			summary, rerr := reloadConfig(logWriter, resolver,
-				*directDomainsFile, *proxyDomainsFile, *geoipFile)
-			if rerr != nil {
-				log.Printf("SIGHUP reload finished with errors: %s (%v)", summary, rerr)
-				continue
-			}
-			log.Printf("SIGHUP %s", summary)
-		}
-	}()
-
 	// 2. 包装 Resolver：过滤代理域名的 AAAA，防止客户端走真实 IPv6 绕过透明
-	// 代理。始终包装一层以便统计 DNS 平面指标；过滤与否由 enabled 控制。
+	// 代理。始终包装一层以便统计 DNS 平面指标；过滤与否每次查询从热配置
+	// 读取（SIGHUP 改了 -disable-aaaa 立即生效）。
 	appStats := newStats()
 	var r ghdns.Resolver = &aaaaFilter{
 		Resolver: resolver,
 		st:       appStats,
-		enabled:  *disableAAAA,
+		enabled:  rc.aaaaEnabled,
 	}
 
 	// 3. 启动 DNS 服务端（双栈监听，使 v4/v6 的 nat REDIRECT 都能送达）
-	dnsServer, dnsBoundAddr, err := startDNS(r, *dnsAddr)
+	dnsServer, dnsBoundAddr, err := startDNS(r, opts.dns)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -170,11 +260,11 @@ func main() {
 		lnErr error
 	)
 	tcpMode := "redirect"
-	if *tproxyListen != "" {
-		ln, lnErr = startTCPTProxy(*tproxyListen)
+	if opts.tproxyListen != "" {
+		ln, lnErr = startTCPTProxy(opts.tproxyListen)
 		tcpMode = "tproxy"
 	} else {
-		ln, lnErr = net.Listen("tcp", *listen)
+		ln, lnErr = net.Listen("tcp", opts.listen)
 	}
 	if lnErr != nil {
 		log.Fatalf("listen tcp failed: %v", lnErr)
@@ -182,18 +272,64 @@ func main() {
 
 	// 5. UDP 透明转发（默认关闭）：REDIRECT（v4）或 TPROXY（双栈），
 	// 需配合对应防火墙规则显式启用
-	gw := newUDPGateway(r, *socks, *socksUser, *socksPass)
+	gw := newUDPGateway(r, opts.socks, opts.socksUser, opts.socksPass)
 	gw.setStats(appStats)
 	appStats.registerGauges(map[string]func() int64{
 		"udp_active_clients": func() int64 { n, _ := gw.activeCounts(); return n },
 		"udp_active_flows":   func() int64 { _, n := gw.activeCounts(); return n },
 		"udp_assoc_up":       gw.proxy.assocIsUp,
 	})
-	// /readyz 对上游 SOCKS5 做只读握手探测（不发 CONNECT，无目标流量）
+	// /readyz 对上游 SOCKS5 做只读握手探测（不发 CONNECT，无目标流量）；
+	// 每次探测读热配置，换了上游后探针也跟着指向新上游。
 	readyCheck := func() error {
-		return probeSocksUpstream(*socks, *socksUser, *socksPass)
+		hs := rc.get()
+		return probeSocksUpstream(hs.socks, hs.socksUser, hs.socksPass)
 	}
-	statsSrv := startStatsServer(*statsAddr, appStats, readyCheck, *pprofEnable)
+	statsSrv := startStatsServer(opts.statsAddr, appStats, readyCheck, opts.pprofEnable)
+
+	// SIGHUP 热重载：①重读配置文件（热项立即生效，冷项提示需重启）
+	// ②重新打开日志文件（外部 logrotate）③全量重载分流域名表/GeoIP、
+	// 清 DNS 缓存；不重建监听、不中断在途连接。
+	hupCh := notifyReload()
+	defer stopReload(hupCh)
+	go func() {
+		for range hupCh {
+			if cfgFile.path != "" {
+				prev := rc.get()
+				next, changed, cold, err := reloadRuntimeOptions(cfgFile.path, cmdline, builtin, prev)
+				if err != nil {
+					// 文件写坏了就保持旧配置：绝不能让一次 SIGHUP
+					// 把正在跑的代理变成没有上游。
+					log.Printf("SIGHUP reload: config %s not applied: %v", cfgFile.path, err)
+				} else {
+					rc.set(next)
+					if len(changed) > 0 {
+						log.Printf("SIGHUP reload: applied %s", strings.Join(changed, ", "))
+					}
+					if len(cold) > 0 {
+						log.Printf("SIGHUP reload: %s changed but need a restart to take effect",
+							strings.Join(cold, ", "))
+					}
+					if next.socks != prev.socks || next.socksUser != prev.socksUser ||
+						next.socksPass != prev.socksPass {
+						// UDP 侧已建立的 ASSOCIATE 属于旧上游，必须作废
+						// 重建；TCP 侧本就是每连接读快照，天然生效。
+						gw.setUpstream(next.socks, next.socksUser, next.socksPass)
+						log.Printf("SIGHUP reload: upstream now %s (%s)",
+							next.socks, describeAuth(next.socksUser))
+					}
+				}
+			}
+			hs := rc.get()
+			summary, rerr := reloadConfig(logWriter, resolver,
+				hs.directDomainsFile, hs.proxyDomainsFile, hs.geoipFile)
+			if rerr != nil {
+				log.Printf("SIGHUP reload finished with errors: %s (%v)", summary, rerr)
+				continue
+			}
+			log.Printf("SIGHUP %s", summary)
+		}
+	}()
 
 	gwCtx, gwCancel := context.WithCancel(context.Background())
 	defer gwCancel()
@@ -202,43 +338,43 @@ func main() {
 	var stopUDP func()
 	udpMode := "off"
 	switch {
-	case *udpTProxy != "":
-		stop, err := startUDPTProxy(*udpTProxy, gw)
+	case opts.udpTProxy != "":
+		stop, err := startUDPTProxy(opts.udpTProxy, gw)
 		if err != nil {
-			log.Fatalf("start udp tproxy on %s failed: %v", *udpTProxy, err)
+			log.Fatalf("start udp tproxy on %s failed: %v", opts.udpTProxy, err)
 		}
 		stopUDP = stop
-		udpMode = "tproxy=" + *udpTProxy
-		log.Printf("udp relay enabled: udp-tproxy=%s -> socks=%s", *udpTProxy, *socks)
-	case *udpListen != "":
-		stop, err := startUDPFrontend(*udpListen, gw)
+		udpMode = "tproxy=" + opts.udpTProxy
+		log.Printf("udp relay enabled: udp-tproxy=%s -> socks=%s", opts.udpTProxy, opts.socks)
+	case opts.udpListen != "":
+		stop, err := startUDPFrontend(opts.udpListen, gw)
 		if err != nil {
-			log.Fatalf("start udp frontend on %s failed: %v", *udpListen, err)
+			log.Fatalf("start udp frontend on %s failed: %v", opts.udpListen, err)
 		}
 		stopUDP = stop
-		udpMode = "redirect=" + *udpListen
-		log.Printf("udp relay enabled: udplisten=%s -> socks=%s", *udpListen, *socks)
+		udpMode = "redirect=" + opts.udpListen
+		log.Printf("udp relay enabled: udplisten=%s -> socks=%s", opts.udpListen, opts.socks)
 	}
 
-	tcpListenDesc := *listen
-	if *tproxyListen != "" {
-		tcpListenDesc = *tproxyListen
+	tcpListenDesc := opts.listen
+	if opts.tproxyListen != "" {
+		tcpListenDesc = opts.tproxyListen
 	}
 	log.Printf("domain-socks started: socks=%s dns=%s tcp(%s)=%s aaaa-filter=%v udp=%s",
-		*socks, dnsBoundAddr, tcpMode, tcpListenDesc, *disableAAAA, udpMode)
+		opts.socks, dnsBoundAddr, tcpMode, tcpListenDesc, opts.disableAAAA, udpMode)
 	// 生效配置单行回显（与上面的版本行一起写进历史日志），排查"配置没生效"
 	// 类问题时不用翻 init 脚本；只回显是否有认证与用户名，绝不输出密码。
-	statsOpt := nonEmpty(*statsAddr, "off")
+	statsOpt := nonEmpty(opts.statsAddr, "off")
 	log.Printf("config: file=%s auth=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
 		nonEmpty(cfgFile.path, "none"),
-		describeAuth(*socksUser), *directDNS, statsOpt, *pprofEnable, *accessLog,
-		nonEmpty(*geoipFile, "off"),
-		nonEmpty(*directDomainsFile, "-"), nonEmpty(*proxyDomainsFile, "-"))
+		describeAuth(opts.socksUser), opts.directDNS, statsOpt, opts.pprofEnable, opts.accessLog,
+		nonEmpty(opts.geoipFile, "off"),
+		nonEmpty(opts.directDomainsFile, "-"), nonEmpty(opts.proxyDomainsFile, "-"))
 
 	// REDIRECT 模式需 SO_ORIGINAL_DST 反查（v4）；TPROXY 不做 NAT，
 	// 已 accept 连接的 LocalAddr 即原始目标（天然支持 v4/v6）。
 	dstOf := originalDst
-	if *tproxyListen != "" {
+	if opts.tproxyListen != "" {
 		dstOf = localDst
 	}
 
@@ -257,7 +393,10 @@ func main() {
 			go func() {
 				defer wg.Done()
 				defer active.remove(c)
-				handleConn(c, r, *socks, *socksUser, *socksPass, dstOf, appStats, *accessLog)
+				// 每条连接开始时读一次热配置快照：整条连接用同一份
+				// 上游与认证，中途 SIGHUP 不会撕裂已建连的连接。
+				hs := rc.get()
+				handleConn(c, r, hs.socks, hs.socksUser, hs.socksPass, dstOf, appStats, hs.accessLog)
 			}()
 		}
 	}()
@@ -299,10 +438,13 @@ func main() {
 //     回退到 A 记录（Fake-IP），避免拿到真实 IPv6 后绕过透明代理泄漏；
 //     直连域名的 AAAA 正常透传，保留国内双栈。ShouldProxy 出错按代理处理。
 //  2. DNS 平面指标：查询总数、AAAA 数、拦截数、Fake-IP 应答数、上游错误数。
+//
+// enabled 是函数而非常量：SIGHUP 改了 -disable-aaaa 后下一个查询即按新
+// 值处理，不必重启（DNS 是查询级无状态路径，中途切换是安全的）。
 type aaaaFilter struct {
 	ghdns.Resolver
 	st      *stats
-	enabled bool
+	enabled func() bool
 }
 
 func (f *aaaaFilter) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
@@ -310,7 +452,7 @@ func (f *aaaaFilter) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, erro
 	if req != nil && len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA {
 		f.st.inc(statDNSAAAA)
 		name := strings.TrimSuffix(req.Question[0].Name, ".")
-		if f.enabled {
+		if f.enabled != nil && f.enabled() {
 			if proxy, _ := f.Resolver.ShouldProxy(name); proxy {
 				f.st.inc(statDNSAAAAFiltered)
 				resp := new(dns.Msg)

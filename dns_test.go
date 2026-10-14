@@ -271,7 +271,7 @@ func (s *stubExchangeResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns
 
 func TestAAAAFilter(t *testing.T) {
 	stub := &stubExchangeResolver{proxyDomains: map[string]bool{"www.google.com": true}}
-	f := &aaaaFilter{Resolver: stub, enabled: true}
+	f := &aaaaFilter{Resolver: stub, enabled: func() bool { return true }}
 
 	// 代理域名 AAAA：返回空 NOERROR，且不得透传到上游（防 IPv6 泄漏）
 	req := new(dns.Msg)
@@ -320,7 +320,7 @@ func TestDNSMetrics(t *testing.T) {
 		},
 	}
 	st := newStats()
-	f := &aaaaFilter{Resolver: stub, st: st, enabled: true}
+	f := &aaaaFilter{Resolver: stub, st: st, enabled: func() bool { return true }}
 
 	aaaaProxy := new(dns.Msg)
 	aaaaProxy.SetQuestion("www.google.com.", dns.TypeAAAA)
@@ -366,7 +366,7 @@ func TestDNSMetrics(t *testing.T) {
 	stub.fail = nil
 
 	// enabled=false：代理域名 AAAA 也透传，filtered 不再增长
-	f.enabled = false
+	f.enabled = func() bool { return false }
 	if _, err := f.Exchange(context.Background(), aaaaProxy); err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestDNSUpstreamLatencyHistogram(t *testing.T) {
 		delay:        5 * time.Millisecond,
 	}
 	st := newStats()
-	f := &aaaaFilter{Resolver: stub, st: st, enabled: true}
+	f := &aaaaFilter{Resolver: stub, st: st, enabled: func() bool { return true }}
 
 	// 代理 AAAA：本地短路，零上游观测
 	aaaaProxy := new(dns.Msg)

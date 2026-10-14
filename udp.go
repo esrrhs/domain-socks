@@ -92,6 +92,13 @@ func (g *udpGateway) setStats(s *stats) {
 	g.proxy.stats = s
 }
 
+// setUpstream 热替换上游 SOCKS5 地址与认证：SIGHUP 重读配置文件发现
+// socks/socks-user/socks-pass 变了时调用。已在途的 UDP 会话所在连接
+// 不受影响，新会话（及旧 ASSOCIATE 重建）走新上游。
+func (g *udpGateway) setUpstream(proxyAddr, user, pass string) {
+	g.proxy.setUpstream(proxyAddr, user, pass)
+}
+
 // run 启动空闲会话回收。返回前阻塞直到 ctx 取消。
 func (g *udpGateway) run(ctx context.Context) {
 	ticker := time.NewTicker(udpSweep)
@@ -385,6 +392,37 @@ type udpProxyRelay struct {
 	lastDialErr   error
 	closed        bool
 	stats         *stats
+	// gen 是上游代次：SIGHUP 换了上游就自增。在途握手发现代次变了会
+	// 丢弃自己刚建好的 association，不会把旧上游的端点装回 relay。
+	gen uint64
+}
+
+// creds 取一份上游地址与认证的快照：握手在锁外进行，必须一次性读齐，
+// 否则与热更新并发时会出现"新地址 + 旧密码"。
+func (r *udpProxyRelay) creds() (addr, user, pass string, gen uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.proxyAddr, r.user, r.pass, r.gen
+}
+
+// setUpstream 热更新上游地址与认证（SIGHUP 重读配置文件后调用）。
+// 已建立的 ASSOCIATE 属于旧上游，立即作废：下一个入站包用新地址重新
+// 握手。不置 closed，relay 仍可重建。
+func (r *udpProxyRelay) setUpstream(proxyAddr, user, pass string) {
+	r.mu.Lock()
+	r.proxyAddr, r.user, r.pass = proxyAddr, user, pass
+	r.gen++
+	control, relay := r.control, r.relay
+	r.control, r.relay, r.relayAddr = nil, nil, nil
+	// 上游换了，旧地址上的失败冷却不再有意义
+	r.cooldownUntil, r.lastDialErr = time.Time{}, nil
+	r.mu.Unlock()
+	if control != nil {
+		control.Close()
+	}
+	if relay != nil {
+		relay.Close()
+	}
 }
 
 // assocIsUp 供统计 gauge 查询 association 在线状态
@@ -476,12 +514,14 @@ func (r *udpProxyRelay) ensureAssoc() error {
 // buildAssoc 执行一次完整的 ASSOCIATE 握手，调用方必须已持有"建连者"
 // 身份（ensureAssoc 保证全局唯一在途）。
 func (r *udpProxyRelay) buildAssoc() error {
-	control, err := net.DialTimeout("tcp", r.proxyAddr, udpAssocTimeout)
+	// 一次性取齐凭证与代次：握手全程在锁外，热更新可能中途发生。
+	addr, user, pass, gen := r.creds()
+	control, err := net.DialTimeout("tcp", addr, udpAssocTimeout)
 	if err != nil {
 		return err
 	}
 	_ = control.SetDeadline(time.Now().Add(udpAssocTimeout))
-	if err = socksNegotiate(control, r.user, r.pass); err != nil {
+	if err = socksNegotiate(control, user, pass); err != nil {
 		control.Close()
 		return err
 	}
@@ -524,6 +564,14 @@ func (r *udpProxyRelay) buildAssoc() error {
 		relayConn.Close()
 		control.Close()
 		return errAssocClosed
+	}
+	if r.gen != gen {
+		// 握手期间上游被热更新替换：这次结果属于旧上游，直接丢弃，
+		// 下一个包会用新地址重拨。
+		r.mu.Unlock()
+		relayConn.Close()
+		control.Close()
+		return errors.New("udp upstream changed during associate")
 	}
 	r.control = control
 	r.relay = relayConn

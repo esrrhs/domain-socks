@@ -26,7 +26,10 @@ LOG_BACKUPS="${LOG_BACKUPS:-3}"
 # direct/proxy-domains-file、geoip、disable-aaaa、stats-addr、access-log 等。
 # 优先级：本脚本注入的命令行项（-socks/-dns/-listen/-tproxy/-log-* …）
 # > 配置文件 > 内置默认；即配置文件中重复给 socks 等不会生效。
-# 改文件后需 restart（reload 只重开日志+重载域名/路由，不重读本文件）。
+# 改文件后 reload 即可：SIGHUP 会重读本文件，热项（socks-user/socks-pass、
+# access-log、disable-aaaa、direct/proxy-domains-file、geoip）立即生效，
+# 冷项（dns/listen/tproxy/udp-*/stats-addr/log-*/direct-dns/pprof）只会在
+# 日志里提示需要 restart，绝不静默半生效。
 CONFIG_FILE="${CONFIG_FILE:-}"
 
 # TPROXY 模式（与上面的 REDIRECT 模式互斥，二选一）：
@@ -110,9 +113,9 @@ stop_service() {
 	stop_firewall
 }
 
-# /etc/init.d/domain-socks reload -> SIGHUP：重开日志文件（配合外部
-# logrotate）并全量重载分流域名表/GeoIP、清 DNS 缓存；不重建监听、
-# 不中断在途连接、不重读 CONFIG_FILE。
+# /etc/init.d/domain-socks reload -> SIGHUP：①重读 CONFIG_FILE（热项立即
+# 生效，冷项日志提示需 restart）②重开日志文件（配合外部 logrotate）
+# ③全量重载分流域名表/GeoIP、清 DNS 缓存；不重建监听、不中断在途连接。
 reload_service() {
 	procd_send_signal domain-socks
 }

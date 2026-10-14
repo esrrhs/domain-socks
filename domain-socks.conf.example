@@ -15,8 +15,12 @@
 # (socks, dns, listen/tproxy, udplisten/udp-tproxy, log-file,
 # log-max-mb, log-backups) are overridden by its command line —
 # use the init variables for those, this file for everything else.
-# Changing this file requires a restart; SIGHUP reload only re-opens
-# the log and re-reads the domain/GeoIP files below.
+#
+# SIGHUP (`service domain-socks reload`) re-reads this file: socks,
+# socks-user, socks-pass, access-log, disable-aaaa and the domain/GeoIP
+# paths below take effect online; dns, listen/tproxy, udplisten/
+# udp-tproxy, stats-addr, log-*, direct-dns and pprof are logged as
+# "need a restart" instead of being silently ignored.
 
 # --- upstream SOCKS5 ---
 socks = 192.168.1.101:1080

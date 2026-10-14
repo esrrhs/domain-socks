@@ -46,7 +46,14 @@ log-file = /tmp/domain-socks.log
 access-log = false
 ```
 
-Precedence is command line > config file > built-in defaults. The daemon fails fast (exit 2) on an unreadable file, an unknown key, or a value that cannot be parsed (`log-backups = many`), so a typo can never silently fall back to a default upstream. `-config` is command-line only (no nested includes). SIGHUP reload re-reads the domain/GeoIP/log files but not the config file itself — changing a config-file option requires a process restart.
+Precedence is command line > config file > built-in defaults. The daemon fails fast (exit 2) on an unreadable file, an unknown key, or a value that cannot be parsed (`log-backups = many`), so a typo can never silently fall back to a default upstream. `-config` is command-line only (no nested includes).
+
+SIGHUP (`service domain-socks reload`) re-reads the config file itself and splits the result in two:
+
+- **Applied online** — `socks`, `socks-user`, `socks-pass` (new TCP connections and the next UDP ASSOCIATE use the new upstream; an existing association is dropped and rebuilt), `access-log`, `disable-aaaa`, `direct-domains-file`, `proxy-domains-file`, `geoip`.
+- **Needs a restart** — `dns`, `listen`, `tproxy`, `udplisten`, `udp-tproxy`, `stats-addr`, `log-file`, `log-max-mb`, `log-backups`, `pprof`, `direct-dns`. These are *detected and logged* (`SIGHUP reload: listen changed but need a restart to take effect`) rather than half-applied, so `reload` after editing the file never silently does nothing.
+
+A config file that became unparseable keeps the running configuration: the reload is logged as `SIGHUP reload: config ... not applied` and the daemon keeps its current upstream instead of losing it. Options given on the command line always win — editing the file cannot override them. Removing a key from the file falls back to the built-in default, exactly as if the daemon had been started without it.
 
 ### Options
 
@@ -485,9 +492,11 @@ domain list files, `geoip`, `stats-addr`, `access-log`, …), point
 [`domain-socks.conf.example`](domain-socks.conf.example) for a commented
 template. Keys duplicated with the init script's own command line
 (`socks`, `dns`, `listen`/`tproxy`, `log-*`) are overridden by it; use the
-init variables for those. `/etc/init.d/domain-socks reload` sends SIGHUP
-(reopen log + reload domain lists/GeoIP; config-file and listen changes
-still need `restart`).
+init variables for those. `/etc/init.d/domain-socks reload` sends SIGHUP, which
+now also **re-reads `CONFIG_FILE`**: hot options (upstream/auth, `access-log`,
+`disable-aaaa`, domain-list and GeoIP paths) take effect online, cold ones
+(`dns`/`listen`/`tproxy`/`udp-*`/`stats-addr`/`log-*`/`direct-dns`/`pprof`) are
+logged as needing `restart` instead of being ignored.
 
 ### Signals & graceful shutdown
 
@@ -498,10 +507,12 @@ On `SIGINT`/`SIGTERM` (i.e. `/etc/init.d/domain-socks stop|restart`) the daemon 
 
 The whole shutdown is bounded by a **3s budget**, well inside procd's default 5s `term_timeout` (so it never relies on `SIGKILL`). A graceful stop — even one that had to abandon a connection stuck in a context-less dial — exits with code 0 so procd does not count it as a crash. Sending `SIGTERM`/`SIGINT` a **second time** skips the drain and exits immediately with code 1; every shutdown step is logged to stderr and the rotating log file.
 
-`SIGHUP` (Unix; `kill -HUP $(pidof domain-socks)`) performs an **online reload without dropping connections**: it reopens the log file (point it at the new inode after an external logrotate renames the old one), fully re-reads the `-direct-domains-file`/`-proxy-domains-file` lists (domains removed from the file actually stop matching — the tables are reset and reloaded, built-in defaults are preserved), reopens the GeoIP database when configured, and flushes the DNS cache so new routing rules apply to the next query instead of waiting for TTL expiry. A bad file is reported in the log but does not abort the rest of the reload; on Windows `SIGHUP` does not exist, so restart the service to apply changes.
+`SIGHUP` (Unix; `kill -HUP $(pidof domain-socks)`) performs an **online reload without dropping connections**: it re-reads the config file when one is in use (see Config File above for the hot/cold split — a changed upstream is applied to new TCP connections and to the next UDP ASSOCIATE, while a changed listen address is only reported as needing a restart), reopens the log file (point it at the new inode after an external logrotate renames the old one), fully re-reads the `-direct-domains-file`/`-proxy-domains-file` lists (domains removed from the file actually stop matching — the tables are reset and reloaded, built-in defaults are preserved), reopens the GeoIP database when configured, and flushes the DNS cache so new routing rules apply to the next query instead of waiting for TTL expiry. A bad file is reported in the log but does not abort the rest of the reload, and a broken config file never costs the daemon its current upstream; on Windows `SIGHUP` does not exist, so restart the service to apply changes.
 
 ```sh
-# after editing the domain list or rotating the log:
+# after editing the domain list, the config file, or rotating the log:
 kill -HUP $(pidof domain-socks)
+# log: SIGHUP reload: applied socks, access-log
+# log: SIGHUP reload: listen changed but need a restart to take effect
 # log: SIGHUP reload complete: direct domains=128, proxy domains=34
 ```

@@ -479,6 +479,16 @@ both modes when `kmod-ipt-nat6` is present. Policy-routing `ip rule`
 entries are left in place on stop because they may be shared with other
 services; the stop function's comments document the manual cleanup commands.
 
+For options the init variables do not cover (upstream auth, `direct-dns`,
+domain list files, `geoip`, `stats-addr`, `access-log`, …), point
+`CONFIG_FILE=/etc/domain-socks.conf` at a key=value file — see
+[`domain-socks.conf.example`](domain-socks.conf.example) for a commented
+template. Keys duplicated with the init script's own command line
+(`socks`, `dns`, `listen`/`tproxy`, `log-*`) are overridden by it; use the
+init variables for those. `/etc/init.d/domain-socks reload` sends SIGHUP
+(reopen log + reload domain lists/GeoIP; config-file and listen changes
+still need `restart`).
+
 ### Signals & graceful shutdown
 
 On `SIGINT`/`SIGTERM` (i.e. `/etc/init.d/domain-socks stop|restart`) the daemon stops accepting new connections and UDP clients, then drains in two phases so the per-connection bookkeeping (access log line, byte counters, `/top` aggregation, session-length histogram) is flushed instead of being lost with the process:

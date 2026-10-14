@@ -1,0 +1,59 @@
+# domain-socks example config (copy to /etc/domain-socks.conf)
+#
+# One option per line, key=value; the leading -/-- is optional and
+# whole-line # comments are ignored. Values are split on the FIRST =,
+# so passwords may contain =. Precedence: command line > this file >
+# built-in defaults. Start with:
+#
+#   domain-socks -config /etc/domain-socks.conf
+#
+# or, with the OpenWrt init script, set in a local override:
+#
+#   CONFIG_FILE=/etc/domain-socks.conf
+#
+# NOTE: keys already supplied by the init script's own variables
+# (socks, dns, listen/tproxy, udplisten/udp-tproxy, log-file,
+# log-max-mb, log-backups) are overridden by its command line —
+# use the init variables for those, this file for everything else.
+# Changing this file requires a restart; SIGHUP reload only re-opens
+# the log and re-reads the domain/GeoIP files below.
+
+# --- upstream SOCKS5 ---
+socks = 192.168.1.101:1080
+#socks-user = alice
+#socks-pass = s3cr3t=with=equals
+
+# --- domestic DNS for direct resolution (comma-separated) ---
+#direct-dns = 223.5.5.5:53,119.29.29.29:53
+
+# --- extra routing lists (line list or dnsmasq address format) ---
+#direct-domains-file = /etc/domain-socks/direct.list
+#proxy-domains-file = /etc/domain-socks/proxy.list
+
+# --- optional GeoIP-based CN split routing ---
+#geoip = /etc/domain-socks/GeoLite2-Country.mmdb
+
+# --- IPv6 leak guard: keep true unless the upstream itself is IPv6-only ---
+#disable-aaaa = true
+
+# --- read-only metrics endpoint (loopback by default) ---
+#stats-addr = 127.0.0.1:18080
+
+# --- per-connection access log ---
+#access-log = true
+
+# --- listeners / logging (normally set via init script variables instead:
+#     PROXY_SERVER, DNS_PORT, REDIR_PORT, ENABLE_UDP, ENABLE_TPROXY, LOG_FILE)
+# ---
+#dns = [::]:1053
+#listen = 0.0.0.0:12345
+#udplisten = 0.0.0.0:12346
+#tproxy = :12345
+#udp-tproxy = :12346
+#log-file = /tmp/domain-socks.log
+#log-max-mb = 1
+#log-backups = 3
+
+# --- runtime extras ---
+#pprof = false
+#version = false

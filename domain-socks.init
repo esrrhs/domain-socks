@@ -21,6 +21,14 @@ LOG_FILE="${LOG_FILE:-/tmp/domain-socks.log}"
 LOG_MAX_MB="${LOG_MAX_MB:-1}"
 LOG_BACKUPS="${LOG_BACKUPS:-3}"
 
+# 可选 key=value 配置文件（透传给 domain-socks -config），收纳本脚本
+# 变量未覆盖的进阶项：socks-user/socks-pass、direct-dns、
+# direct/proxy-domains-file、geoip、disable-aaaa、stats-addr、access-log 等。
+# 优先级：本脚本注入的命令行项（-socks/-dns/-listen/-tproxy/-log-* …）
+# > 配置文件 > 内置默认；即配置文件中重复给 socks 等不会生效。
+# 改文件后需 restart（reload 只重开日志+重载域名/路由，不重读本文件）。
+CONFIG_FILE="${CONFIG_FILE:-}"
+
 # TPROXY 模式（与上面的 REDIRECT 模式互斥，二选一）：
 # 置 1 后 TCP 走 mangle TPROXY 双栈监听（-tproxy），同时具备 IPv6 截获能力；
 # ENABLE_UDP=1 时 UDP 也走 TPROXY（-udp-tproxy）。
@@ -81,6 +89,7 @@ start_service() {
 		-log-file $LOG_FILE
 		-log-max-mb $LOG_MAX_MB
 		-log-backups $LOG_BACKUPS"
+	[ -n "$CONFIG_FILE" ] && args="$args -config $CONFIG_FILE"
 
 	procd_open_instance
 	# -dns 的 [::]:port 含 glob 字符 '['，关闭文件名展开后再分词传参，
@@ -99,6 +108,13 @@ start_service() {
 
 stop_service() {
 	stop_firewall
+}
+
+# /etc/init.d/domain-socks reload -> SIGHUP：重开日志文件（配合外部
+# logrotate）并全量重载分流域名表/GeoIP、清 DNS 缓存；不重建监听、
+# 不中断在途连接、不重读 CONFIG_FILE。
+reload_service() {
+	procd_send_signal domain-socks
 }
 
 # start_firewall 只劫持 PREROUTING（LAN 设备转发流量），不碰 OUTPUT：

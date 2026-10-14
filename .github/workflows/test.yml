@@ -24,3 +24,6 @@ jobs:
 
       - name: Test build (Linux)
         run: GOOS=linux GOARCH=amd64 go build -v .
+
+      - name: Cross build (OpenWrt targets, same script as local builds)
+        run: ./build-openwrt.sh linux/mipsle linux/mips linux/arm64 linux/arm

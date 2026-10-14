@@ -27,8 +27,30 @@ A lightweight Fake-IP transparent proxy client designed for OpenWrt and Linux ro
 domain-socks -socks <proxy_ip:port> -dns <dns_listen> -listen <redirect_listen>
 ```
 
+### Config File
+
+Every option below (except `-config` itself) can also be given in a simple `key=value` file, which keeps long router command lines in one reviewable place:
+
+```bash
+domain-socks -config /etc/domain-socks.conf
+```
+
+```ini
+# /etc/domain-socks.conf — one option per line, key=value
+# (leading -/-- optional, # marks a full-line comment)
+socks = 192.168.1.101:1080
+socks-user = alice
+# values are split on the first = only, so: socks-pass = a=b
+udplisten = 0.0.0.0:12346
+log-file = /tmp/domain-socks.log
+access-log = false
+```
+
+Precedence is command line > config file > built-in defaults. The daemon fails fast (exit 2) on an unreadable file, an unknown key, or a value that cannot be parsed (`log-backups = many`), so a typo can never silently fall back to a default upstream. `-config` is command-line only (no nested includes). SIGHUP reload re-reads the domain/GeoIP/log files but not the config file itself — changing a config-file option requires a process restart.
+
 ### Options
 
+- `-config`: Path to a `key=value` config file supplying defaults for all other options (see Config File above; command line wins)
 - `-socks`: Upstream SOCKS5 proxy address (default: `192.168.1.101:1081`)
 - `-socks-user`: Upstream SOCKS5 username (optional, RFC 1929)
 - `-socks-pass`: Upstream SOCKS5 password (optional, RFC 1929)

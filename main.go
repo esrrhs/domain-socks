@@ -21,27 +21,42 @@ import (
 )
 
 func main() {
-	socks := flag.String("socks", "192.168.1.101:1081", "upstream socks5")
-	socksUser := flag.String("socks-user", "", "upstream socks5 username")
-	socksPass := flag.String("socks-pass", "", "upstream socks5 password")
-	dnsAddr := flag.String("dns", "[::]:1053", "dns listen address; wildcard listens dual-stack (v4+v6) and falls back to v4-only if the kernel lacks IPv6")
-	listen := flag.String("listen", "0.0.0.0:12345", "transparent redirect listen")
-	directDNS := flag.String("direct-dns", "223.5.5.5:53,119.29.29.29:53", "domestic upstream DNS servers (comma-separated)")
-	directDomainsFile := flag.String("direct-domains-file", "", "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
-	proxyDomainsFile := flag.String("proxy-domains-file", "", "optional file containing extra proxy domains (e.g. dnsmasq format or line list)")
-	geoipFile := flag.String("geoip", "", "optional GeoLite2-Country.mmdb path for IP-based CN split routing")
-	disableAAAA := flag.Bool("disable-aaaa", true, "answer AAAA queries of proxy domains with empty NOERROR to prevent IPv6 bypass leak")
-	udpListen := flag.String("udplisten", "", "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
-	tproxyListen := flag.String("tproxy", "", "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
-	udpTProxy := flag.String("udp-tproxy", "", "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
-	statsAddr := flag.String("stats-addr", "127.0.0.1:18080", "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
-	accessLog := flag.Bool("access-log", true, "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
-	logFile := flag.String("log-file", "", "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
-	logMaxMB := flag.Int("log-max-mb", 1, "max size in MB of one log file before it is rotated to .1")
-	logBackups := flag.Int("log-backups", 3, "number of rotated backup files to keep (.1 newest .. .N oldest)")
-	showVersion := flag.Bool("version", false, "print the embedded build version (git commit) and exit")
-	pprofEnable := flag.Bool("pprof", false, "expose Go runtime pprof diagnostics at /debug/pprof/ on the stats address (goroutine stacks, heap, CPU profile; stats addr defaults to loopback)")
+	// 配置文件先行：文件值作为各 flag 的默认注入，命令行显式传参
+	// 由 flag 包覆盖 —— 优先级天然是 命令行 > 配置文件 > 内置默认。
+	cfgFile, err := loadConfig(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	socks := flag.String("socks", cfgFile.String("socks", "192.168.1.101:1081"), "upstream socks5")
+	flag.String("config", "", "key=value config file supplying flag defaults (comments with #; command line overrides the file; this flag itself is command-line only)")
+	socksUser := flag.String("socks-user", cfgFile.String("socks-user", ""), "upstream socks5 username")
+	socksPass := flag.String("socks-pass", cfgFile.String("socks-pass", ""), "upstream socks5 password")
+	dnsAddr := flag.String("dns", cfgFile.String("dns", "[::]:1053"), "dns listen address; wildcard listens dual-stack (v4+v6) and falls back to v4-only if the kernel lacks IPv6")
+	listen := flag.String("listen", cfgFile.String("listen", "0.0.0.0:12345"), "transparent redirect listen")
+	directDNS := flag.String("direct-dns", cfgFile.String("direct-dns", "223.5.5.5:53,119.29.29.29:53"), "domestic upstream DNS servers (comma-separated)")
+	directDomainsFile := flag.String("direct-domains-file", cfgFile.String("direct-domains-file", ""), "optional file containing extra direct domains (e.g. dnsmasq format or line list)")
+	proxyDomainsFile := flag.String("proxy-domains-file", cfgFile.String("proxy-domains-file", ""), "optional file containing extra proxy domains (e.g. dnsmasq format or line list)")
+	geoipFile := flag.String("geoip", cfgFile.String("geoip", ""), "optional GeoLite2-Country.mmdb path for IP-based CN split routing")
+	disableAAAA := flag.Bool("disable-aaaa", cfgFile.Bool("disable-aaaa", true), "answer AAAA queries of proxy domains with empty NOERROR to prevent IPv6 bypass leak")
+	udpListen := flag.String("udplisten", cfgFile.String("udplisten", ""), "transparent UDP redirect listen (empty disables UDP relay, e.g. 0.0.0.0:12346; requires matching nat REDIRECT rule)")
+	tproxyListen := flag.String("tproxy", cfgFile.String("tproxy", ""), "TCP TPROXY dual-stack listen (e.g. :12345); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -listen")
+	udpTProxy := flag.String("udp-tproxy", cfgFile.String("udp-tproxy", ""), "UDP TPROXY dual-stack listen (e.g. :12346); enables IPv6 interception; requires mangle TPROXY + policy routing; mutually exclusive with -udplisten")
+	statsAddr := flag.String("stats-addr", cfgFile.String("stats-addr", "127.0.0.1:18080"), "read-only runtime metrics HTTP endpoint (GET / text, /json); empty disables; bind 0.0.0.0/:: at your own risk")
+	accessLog := flag.Bool("access-log", cfgFile.Bool("access-log", true), "log one summary line per intercepted TCP connection when it closes (route, up/down bytes, duration, dial error); set -access-log=false to silence")
+	logFile := flag.String("log-file", cfgFile.String("log-file", ""), "also append logs to a size-rotating file for post-mortem debugging on the router (empty disables; e.g. /tmp/domain-socks.log)")
+	logMaxMB := flag.Int("log-max-mb", cfgFile.Int("log-max-mb", 1), "max size in MB of one log file before it is rotated to .1")
+	logBackups := flag.Int("log-backups", cfgFile.Int("log-backups", 3), "number of rotated backup files to keep (.1 newest .. .N oldest)")
+	showVersion := flag.Bool("version", cfgFile.Bool("version", false), "print the embedded build version (git commit) and exit")
+	pprofEnable := flag.Bool("pprof", cfgFile.Bool("pprof", false), "expose Go runtime pprof diagnostics at /debug/pprof/ on the stats address (goroutine stacks, heap, CPU profile; stats addr defaults to loopback)")
 	flag.Parse()
+
+	// 配置文件的键必须真实存在、值必须类型正确：路由器上一个拼写错误
+	// 就可能让 socks 上游静默回落到内置默认值，等于流量走错方向。
+	if err := cfgFile.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	// -version 只输出一行版本信息即退出，不初始化任何服务、不碰日志文件。
 	if *showVersion {
@@ -82,6 +97,11 @@ func main() {
 			listenExplicitlySet = true
 		}
 	})
+	// 配置文件给出非空 listen 等同于显式指定（它已注入为 flag 默认值，
+	// flag.Visit 看不到），互斥校验必须一起算上。
+	if !listenExplicitlySet && cfgFile.Has("listen") && *listen != "" {
+		listenExplicitlySet = true
+	}
 	if *tproxyListen != "" && listenExplicitlySet {
 		log.Fatal("-tproxy is mutually exclusive with -listen (choose one TCP interception mode)")
 	}
@@ -209,7 +229,8 @@ func main() {
 	// 生效配置单行回显（与上面的版本行一起写进历史日志），排查"配置没生效"
 	// 类问题时不用翻 init 脚本；只回显是否有认证与用户名，绝不输出密码。
 	statsOpt := nonEmpty(*statsAddr, "off")
-	log.Printf("config: auth=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
+	log.Printf("config: file=%s auth=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
+		nonEmpty(cfgFile.path, "none"),
 		describeAuth(*socksUser), *directDNS, statsOpt, *pprofEnable, *accessLog,
 		nonEmpty(*geoipFile, "off"),
 		nonEmpty(*directDomainsFile, "-"), nonEmpty(*proxyDomainsFile, "-"))

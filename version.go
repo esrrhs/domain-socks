@@ -17,11 +17,17 @@ type buildInfo struct {
 }
 
 func readBuildInfo() buildInfo {
-	var b buildInfo
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
-		return b
+		return buildInfo{}
 	}
+	return buildInfoFrom(bi)
+}
+
+// buildInfoFrom 从 BuildInfo.Settings 提取 VCS 指纹。抽成纯函数是为了
+// 让短 SHA 截断、脏标记等分支可测——真实构建环境的 stamping 输入不可控。
+func buildInfoFrom(bi *debug.BuildInfo) buildInfo {
+	var b buildInfo
 	b.goVersion = bi.GoVersion
 	for _, s := range bi.Settings {
 		switch s.Key {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"testing"
 	"time"
 
@@ -675,21 +674,41 @@ func freeDualStackPort(t *testing.T) int {
 	return port
 }
 
+// startDNSDualStack 在 [::] 上起 DNS 服务并重试若干次：探测到的空闲端口
+// 与真正 bind 之间隔着一次 close，另一个进程（或同机上的并行测试）可能
+// 抢走该端口，属于典型的 TOCTOU 竞争，重试即可，失败信息保留最后一次。
+func startDNSDualStack(t *testing.T, r ghdns.Resolver) (*ghdns.Server, string) {
+	t.Helper()
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		port := freeDualStackPort(t)
+		srv, addr, err := startDNS(r, fmt.Sprintf("[::]:%d", port))
+		if err == nil {
+			return srv, addr
+		}
+		lastErr = err
+	}
+	t.Fatalf("startDNS dual-stack after 5 attempts: %v", lastErr)
+	return nil, ""
+}
+
 // TestStartDNSDualStack 验证默认的 [::]:port 单 socket 在双栈内核上同时
 // 接收 v4(127.0.0.1) 与 v6(::1) 查询——这是两族 nat REDIRECT 能
 // 共用一个 DNS 端口的前提。无 v6 loopback 的环境只断言 v4。
 func TestStartDNSDualStack(t *testing.T) {
-	port := freeDualStackPort(t)
 	stub := &stubExchangeResolver{}
-	srv, _, err := startDNS(stub, fmt.Sprintf("[::]:%d", port))
-	if err != nil {
-		t.Fatalf("startDNS dual-stack: %v", err)
-	}
+	srv, bound := startDNSDualStack(t, stub)
 	defer srv.Stop()
 
-	dnsQueryLoopback(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	// 用服务实际绑定的端口发查询（重试情形下可能是后一次拿到的端口）
+	_, portStr, err := net.SplitHostPort(bound)
+	if err != nil {
+		t.Fatalf("unexpected bound addr %q: %v", bound, err)
+	}
+
+	dnsQueryLoopback(t, net.JoinHostPort("127.0.0.1", portStr))
 	if ipv6LoopbackAvailable() {
-		dnsQueryLoopback(t, net.JoinHostPort("::1", strconv.Itoa(port)))
+		dnsQueryLoopback(t, net.JoinHostPort("::1", portStr))
 	} else {
 		t.Log("IPv6 loopback unavailable, skip ::1 query")
 	}

@@ -232,6 +232,17 @@ func main() {
 	if opts.geoipFile != "" {
 		cfg.GeoIPFile = opts.geoipFile
 	}
+	// 真正需要远端解析的查询（非 A/AAAA 记录、-disable-aaaa=false 时未列入
+	// 代理表的域名）会走 gohome 的远程 DoH 上游，而 DoH 必须经 socks 出去：
+	// 明文直连 1.1.1.1/8.8.8.8 在国内既不可达（每次等满超时）又是查询泄漏。
+	// 上游带认证时 DoH-over-socks5 走不通（见 socksProxyURL），此时直接
+	// 关掉远程上游让这些查询回落国内上游，也好过明文直连。
+	if url := socksProxyURL(opts.socks, opts.socksUser, opts.socksPass); url != "" {
+		cfg.ProxyAddr = url
+	} else if opts.socksUser != "" || opts.socksPass != "" {
+		cfg.RemoteUpstreams = nil
+		log.Printf("remote DoH disabled: upstream socks requires auth, which DoH-over-socks5 cannot carry")
+	}
 
 	resolver, err := ghdns.NewResolver(cfg)
 	if err != nil {
@@ -314,9 +325,15 @@ func main() {
 						next.socksPass != prev.socksPass {
 						// UDP 侧已建立的 ASSOCIATE 属于旧上游，必须作废
 						// 重建；TCP 侧本就是每连接读快照，天然生效。
-						gw.setUpstream(next.socks, next.socksUser, next.socksPass)
+						// resolver 的远程 DoH 也一并指向新代理。
+						if err := applyUpstream(gw, resolver, next.socks, next.socksUser, next.socksPass); err != nil {
+							log.Printf("SIGHUP reload: remote DNS proxy not updated: %v", err)
+						}
 						log.Printf("SIGHUP reload: upstream now %s (%s)",
 							next.socks, describeAuth(next.socksUser))
+						if next.socksUser != "" || next.socksPass != "" {
+							log.Printf("SIGHUP reload: upstream needs auth, remote DoH keeps the previous proxy until restart")
+						}
 					}
 				}
 			}
@@ -365,9 +382,15 @@ func main() {
 	// 生效配置单行回显（与上面的版本行一起写进历史日志），排查"配置没生效"
 	// 类问题时不用翻 init 脚本；只回显是否有认证与用户名，绝不输出密码。
 	statsOpt := nonEmpty(opts.statsAddr, "off")
-	log.Printf("config: file=%s auth=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
+	// remote-doh：需要真实远端解析的查询（罕见路径，见 socksProxyURL）走
+	// 远程 DoH 时的出口；off 表示上游带认证、DoH 已关闭并回落国内上游。
+	remoteDoH := "via-socks"
+	if len(cfg.RemoteUpstreams) == 0 {
+		remoteDoH = "off"
+	}
+	log.Printf("config: file=%s auth=%s remote-doh=%s direct-dns=%q stats=%s pprof=%v access-log=%v geoip=%s lists direct=%q proxy=%q",
 		nonEmpty(cfgFile.path, "none"),
-		describeAuth(opts.socksUser), opts.directDNS, statsOpt, opts.pprofEnable, opts.accessLog,
+		describeAuth(opts.socksUser), remoteDoH, opts.directDNS, statsOpt, opts.pprofEnable, opts.accessLog,
 		nonEmpty(opts.geoipFile, "off"),
 		nonEmpty(opts.directDomainsFile, "-"), nonEmpty(opts.proxyDomainsFile, "-"))
 

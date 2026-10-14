@@ -114,6 +114,40 @@ func pickBool(cmdline map[string]bool, name string, cur, def bool) bool {
 	return def
 }
 
+// upstreamSetter / proxyAddrUpdater 是热更新上游时需要同步的下游：前者
+// 是 UDP relay（换上游即作废旧 ASSOCIATE），后者是 resolver 的远程 DoH
+// 代理地址。抽成接口以便单测编排。
+type upstreamSetter interface {
+	setUpstream(addr, user, pass string)
+}
+
+type proxyAddrUpdater interface {
+	UpdateProxyAddress(proxyAddr string) error
+}
+
+// socksProxyURL 把 -socks 的 host:port 转成 gohome DoH 上游能识别的
+// socks5 URL。注意 gohome 内部用 proxy.SOCKS5("tcp", host, nil, ...) 构造
+// 拨号器 —— **忽略 URL 里的 userinfo**，也就是说 DoH over socks5 无法带
+// 用户名密码。因此只在 -socks 无认证时返回可用 URL：宁可不用远端 DNS，
+// 也不能让需要远端解析的查询明文直连（既不可达又泄漏查询内容）。
+func socksProxyURL(addr, user, pass string) string {
+	if addr == "" || user != "" || pass != "" {
+		return ""
+	}
+	return "socks5://" + addr
+}
+
+// applyUpstream 把新上游同步给所有持有它的组件。带认证的上游走不了 DoH
+// 代理，此时 resolver 保持现状（调用方负责提示重启），绝不回落成明文直连。
+func applyUpstream(gw upstreamSetter, rl proxyAddrUpdater, addr, user, pass string) error {
+	gw.setUpstream(addr, user, pass)
+	url := socksProxyURL(addr, user, pass)
+	if url == "" || rl == nil {
+		return nil
+	}
+	return rl.UpdateProxyAddress(url)
+}
+
 // reloadRuntimeOptions 重读配置文件，按"命令行 > 配置文件 > 内置默认"
 // 重新计算生效值。返回新快照、本次热生效的键、以及改了但必须重启的键。
 // 任何解析/校验错误都原样返回旧快照：一次写坏的 SIGHUP 不能让正在跑的

@@ -282,6 +282,85 @@ func TestAAAAFilterFollowsHotConfig(t *testing.T) {
 	}
 }
 
+type fakeUpstreamSetter struct {
+	addr, user, pass string
+	calls            int
+}
+
+func (f *fakeUpstreamSetter) setUpstream(addr, user, pass string) {
+	f.addr, f.user, f.pass = addr, user, pass
+	f.calls++
+}
+
+type fakeProxyUpdater struct {
+	got []string
+	err error
+}
+
+func (f *fakeProxyUpdater) UpdateProxyAddress(addr string) error {
+	f.got = append(f.got, addr)
+	return f.err
+}
+
+// TestSocksProxyURL 验证"能带认证才用"的规则：gohome 的 DoH over socks5
+// 拨号器忽略 userinfo，带认证时必须放弃远端 DoH 而不是明文直连。
+func TestSocksProxyURL(t *testing.T) {
+	cases := []struct {
+		addr, user, pass, want string
+	}{
+		{"192.168.1.101:1081", "", "", "socks5://192.168.1.101:1081"},
+		{"[::1]:1080", "", "", "socks5://[::1]:1080"},
+		{"192.168.1.101:1081", "alice", "", ""}, // 有用户名：不可用
+		{"192.168.1.101:1081", "", "pw", ""},    // 有密码：不可用
+		{"", "", "", ""},                        // 未配置上游
+	}
+	for _, c := range cases {
+		if got := socksProxyURL(c.addr, c.user, c.pass); got != c.want {
+			t.Fatalf("socksProxyURL(%q,%q,%q)=%q want %q", c.addr, c.user, c.pass, got, c.want)
+		}
+	}
+}
+
+// TestApplyUpstreamSyncsRemoteDNS 验证换上游时远程 DoH 的代理地址跟着换：
+// 否则需要远端解析的查询会明文直连出去（不可达 + 泄漏）。
+func TestApplyUpstreamSyncsRemoteDNS(t *testing.T) {
+	gw := &fakeUpstreamSetter{}
+	rl := &fakeProxyUpdater{}
+	if err := applyUpstream(gw, rl, "10.0.0.2:1080", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if gw.calls != 1 || gw.addr != "10.0.0.2:1080" {
+		t.Fatalf("udp relay not updated: %+v", gw)
+	}
+	if len(rl.got) != 1 || rl.got[0] != "socks5://10.0.0.2:1080" {
+		t.Fatalf("remote DoH proxy not updated: %v", rl.got)
+	}
+
+	// 带认证：UDP 数据面照常切，但 DoH 代理不得被换成无认证地址
+	rl.got = nil
+	if err := applyUpstream(gw, rl, "10.0.0.3:1080", "alice", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	if gw.addr != "10.0.0.3:1080" || gw.user != "alice" {
+		t.Fatalf("udp relay must still switch: %+v", gw)
+	}
+	if len(rl.got) != 0 {
+		t.Fatalf("must not point DoH at an auth-required proxy: %v", rl.got)
+	}
+
+	// resolver 更新失败要上抛（由调用方记日志），且不影响已切的数据面
+	rl.err = errStubUpdate
+	rl.got = nil
+	if err := applyUpstream(gw, rl, "10.0.0.4:1080", "", ""); err == nil {
+		t.Fatal("expected UpdateProxyAddress error to surface")
+	}
+	if gw.addr != "10.0.0.4:1080" {
+		t.Fatalf("udp relay must already be switched: %+v", gw)
+	}
+}
+
+var errStubUpdate = fmt.Errorf("stub update failure")
+
 // TestUDPGatewaySetUpstream 验证换了上游之后 UDP 侧会用新地址重新握手：
 // 旧 ASSOCIATE 作废，新包走新上游（否则换 socks 后 UDP 流量仍打向旧代理）。
 func TestUDPGatewaySetUpstream(t *testing.T) {

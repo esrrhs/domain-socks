@@ -3,7 +3,7 @@ module domain-socks
 go 1.27.1
 
 require (
-	github.com/esrrhs/gohome v0.0.0-20261008233426-8124be7601dc
+	github.com/esrrhs/gohome v0.0.0-20261014234818-db8ee1e62c97
 	github.com/miekg/dns v1.1.63
 	golang.org/x/sys v0.48.0
 )

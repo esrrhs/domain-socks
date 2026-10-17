@@ -213,9 +213,11 @@ func (g *udpGateway) handle(data []byte, clientKey string, dstIP net.IP, dstPort
 	var target, flowKey string
 	var viaProxy bool
 	if g.resolver.IsFakeIP(dstIP) {
+		viaProxy = true
 		if domain, ok := g.resolver.LookupDomainByFakeIP(dstIP); ok && domain != "" {
 			target = domain
-			viaProxy = true
+		} else {
+			target = dstIP.String()
 		}
 	}
 	if target == "" {

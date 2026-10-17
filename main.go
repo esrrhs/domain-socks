@@ -236,15 +236,15 @@ func main() {
 	// 代理表的域名）会走 gohome 的远程 DoH 上游，而 DoH 必须经 socks 出去：
 	// 明文直连 1.1.1.1/8.8.8.8 在国内既不可达（每次等满超时）又是查询泄漏。
 	// 上游带认证时 DoH-over-socks5 走不通（见 socksProxyURL），此时直接
-	// 让远程上游回落国内直连上游；若直接置空会被 gohome.NewResolver 补全为
-	// 默认 1.1.1.1/8.8.8.8 导致直连超时。
+	// 禁用远程上游让这些查询回落国内上游，也好过明文直连。
 	remoteDoH := "via-socks"
 	if url := socksProxyURL(opts.socks, opts.socksUser, opts.socksPass); url != "" {
 		cfg.ProxyAddr = url
 	} else if opts.socksUser != "" || opts.socksPass != "" {
-		cfg.RemoteUpstreams = append([]string{}, cfg.DirectUpstreams...)
-		remoteDoH = "fallback-direct"
-		log.Printf("remote DoH disabled: upstream socks requires auth, falling back remote upstreams to direct DNS")
+		cfg.DisableRemoteUpstreams = true
+		cfg.RemoteUpstreams = nil
+		remoteDoH = "off"
+		log.Printf("remote DoH disabled: upstream socks requires auth, which DoH-over-socks5 cannot carry")
 	}
 
 	resolver, err := ghdns.NewResolver(cfg)
